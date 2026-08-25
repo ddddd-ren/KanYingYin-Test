@@ -1,0 +1,2068 @@
+// ignore_for_file: avoid_print
+
+import 'dart:async';
+import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
+import 'package:kanyingyin/bean/dialog/dialog_helper.dart';
+import 'package:media_kit/media_kit.dart';
+import 'package:media_kit_video/media_kit_video.dart';
+import 'package:mobx/mobx.dart';
+import 'package:flutter_modular/flutter_modular.dart';
+import 'package:kanyingyin/utils/proxy_utils.dart';
+import 'package:kanyingyin/utils/logger.dart';
+import 'package:kanyingyin/utils/utils.dart';
+import 'package:kanyingyin/utils/constants.dart';
+import 'package:kanyingyin/shaders/shaders_controller.dart';
+import 'package:kanyingyin/services/local_subtitle_importer.dart';
+import 'package:kanyingyin/services/local_subtitle_matcher.dart';
+import 'package:kanyingyin/services/cloud/cloud_playback_resolver.dart';
+import 'package:kanyingyin/services/cloud/cloud_drive_client.dart';
+import 'package:kanyingyin/services/cloud/cloud_playback_transport.dart';
+import 'package:kanyingyin/features/player/application/cloud_playback_cache_policy.dart';
+import 'package:kanyingyin/features/player/application/embedded_track_coordinator.dart';
+import 'package:kanyingyin/features/player/application/anime4k_coordinator.dart';
+import 'package:kanyingyin/features/player/application/anime4k_policy.dart';
+import 'package:kanyingyin/features/player/application/anime4k_shader_executor.dart';
+import 'package:kanyingyin/features/player/application/embedded_track_language_preferences.dart';
+import 'package:kanyingyin/features/player/application/player_runtime_preferences.dart';
+import 'package:kanyingyin/features/player/application/player_color_profile.dart';
+import 'package:kanyingyin/features/player/application/player_decoder_recovery_policy.dart';
+import 'package:kanyingyin/features/player/application/player_resource_disposer.dart';
+import 'package:kanyingyin/features/player/application/subtitle_preferences.dart';
+import 'package:kanyingyin/features/player/application/truehd_fallback_policy.dart';
+import 'package:kanyingyin/pages/player/models/embedded_track_info.dart';
+import 'package:kanyingyin/platform/app_platform.dart';
+import 'package:kanyingyin/platform/app_platform_io.dart';
+import 'package:kanyingyin/utils/external_player.dart';
+import 'package:kanyingyin/utils/media_uri_utils.dart';
+import 'package:path/path.dart' as p;
+import 'package:synchronized/synchronized.dart';
+
+part 'player_controller.g.dart';
+
+class _PlayerInitializationCancelled implements Exception {
+  const _PlayerInitializationCancelled();
+}
+
+class PlayerRuntimeSnapshot {
+  const PlayerRuntimeSnapshot({
+    required this.playing,
+    required this.buffering,
+    required this.completed,
+    required this.volume,
+    required this.position,
+    required this.buffer,
+    required this.duration,
+  });
+
+  final bool playing;
+  final bool buffering;
+  final bool completed;
+  final double volume;
+  final Duration position;
+  final Duration buffer;
+  final Duration duration;
+}
+
+bool shouldApplyPlayerProxy({
+  required bool proxyEnabled,
+  required PlaybackNetworkRoute networkRoute,
+}) =>
+    proxyEnabled && networkRoute == PlaybackNetworkRoute.inheritProxy;
+
+List<String>? resolveAnime4kShaderPaths({
+  required String? directoryPath,
+  required Anime4kAction action,
+}) {
+  if (directoryPath == null) return null;
+  final names = switch (action) {
+    Anime4kAction.enableEfficiency => mpvAnime4KShadersLite,
+    Anime4kAction.enableQuality => mpvAnime4KShaders,
+    Anime4kAction.clear => const <String>[],
+  };
+  return names
+      .map((name) => p.join(directoryPath, name))
+      .toList(growable: false);
+}
+
+String cloudPlaybackFailureMessage(String? providerName) {
+  final label = providerName?.trim();
+  return '${label == null || label.isEmpty ? '网盘' : label}播放地址不可用，请重新登录或稍后重试';
+}
+
+class PlaybackInitParams {
+  final String videoUrl;
+  final int offset;
+  final bool isLocalPlayback;
+  final int mediaId;
+  final String sourceLabel;
+  final int episode;
+  final Map<String, String> httpHeaders;
+  final String episodeTitle;
+  final String referer;
+  final int currentRoad;
+  final String? coverUrl;
+  final String? mediaTitle;
+  final String? subtitlePath;
+  final String? subtitleDisplayName;
+  final String? subtitleStorageKey;
+  final String? stableMediaKey;
+  final PlaybackNetworkRoute networkRoute;
+  final String? cloudProviderName;
+  final CloudPlaybackTransport transport;
+  final CloudPlaybackLease? lease;
+  final int? totalBytes;
+  final Future<PlaybackInitParams> Function()? refreshCloudPlayback;
+
+  const PlaybackInitParams({
+    required this.videoUrl,
+    required this.offset,
+    required this.isLocalPlayback,
+    required this.mediaId,
+    required this.sourceLabel,
+    required this.episode,
+    required this.httpHeaders,
+    required this.episodeTitle,
+    required this.referer,
+    required this.currentRoad,
+    this.coverUrl,
+    this.mediaTitle,
+    this.subtitlePath,
+    this.subtitleDisplayName,
+    this.subtitleStorageKey,
+    this.stableMediaKey,
+    this.networkRoute = PlaybackNetworkRoute.inheritProxy,
+    this.cloudProviderName,
+    this.transport = CloudPlaybackTransport.direct,
+    this.lease,
+    this.totalBytes,
+    this.refreshCloudPlayback,
+  });
+
+  PlaybackInitParams withOffset(int value) => PlaybackInitParams(
+        videoUrl: videoUrl,
+        offset: value,
+        isLocalPlayback: isLocalPlayback,
+        mediaId: mediaId,
+        sourceLabel: sourceLabel,
+        episode: episode,
+        httpHeaders: httpHeaders,
+        episodeTitle: episodeTitle,
+        referer: referer,
+        currentRoad: currentRoad,
+        coverUrl: coverUrl,
+        mediaTitle: mediaTitle,
+        subtitlePath: subtitlePath,
+        subtitleDisplayName: subtitleDisplayName,
+        subtitleStorageKey: subtitleStorageKey,
+        stableMediaKey: stableMediaKey,
+        networkRoute: networkRoute,
+        cloudProviderName: cloudProviderName,
+        transport: transport,
+        lease: lease,
+        totalBytes: totalBytes,
+        refreshCloudPlayback: refreshCloudPlayback,
+      );
+}
+
+PlaybackInitParams mergeRefreshedCloudPlayback({
+  required PlaybackInitParams previous,
+  required PlaybackInitParams refreshed,
+  required Duration position,
+}) =>
+    PlaybackInitParams(
+      videoUrl: refreshed.videoUrl,
+      offset: position.inSeconds,
+      isLocalPlayback: refreshed.isLocalPlayback,
+      mediaId: refreshed.mediaId,
+      sourceLabel: refreshed.sourceLabel,
+      episode: refreshed.episode,
+      httpHeaders: refreshed.httpHeaders,
+      episodeTitle: refreshed.episodeTitle,
+      referer: refreshed.referer,
+      currentRoad: refreshed.currentRoad,
+      coverUrl: refreshed.coverUrl,
+      mediaTitle: refreshed.mediaTitle,
+      subtitlePath: refreshed.subtitlePath ?? previous.subtitlePath,
+      subtitleDisplayName:
+          refreshed.subtitleDisplayName ?? previous.subtitleDisplayName,
+      subtitleStorageKey:
+          refreshed.subtitleStorageKey ?? previous.subtitleStorageKey,
+      stableMediaKey: refreshed.stableMediaKey ?? previous.stableMediaKey,
+      networkRoute: refreshed.networkRoute,
+      cloudProviderName:
+          refreshed.cloudProviderName ?? previous.cloudProviderName,
+      transport: refreshed.transport,
+      lease: refreshed.lease,
+      totalBytes: refreshed.totalBytes,
+      refreshCloudPlayback:
+          refreshed.refreshCloudPlayback ?? previous.refreshCloudPlayback,
+    );
+
+class CloudPlaybackRefreshTransaction {
+  const CloudPlaybackRefreshTransaction({
+    required this.previous,
+    required this.position,
+    required this.wasPlaying,
+  });
+
+  final PlaybackInitParams previous;
+  final Duration position;
+  final bool wasPlaying;
+
+  bool get shouldPauseAfterRefresh => !wasPlaying;
+
+  PlaybackInitParams merge(PlaybackInitParams refreshed) =>
+      mergeRefreshedCloudPlayback(
+        previous: previous,
+        refreshed: refreshed,
+        position: position,
+      );
+}
+
+// ignore: library_private_types_in_public_api
+class PlayerController = _PlayerController with _$PlayerController;
+
+abstract class _PlayerController with Store {
+  _PlayerController({
+    SubtitlePreferences? subtitlePreferences,
+    EmbeddedTrackLanguagePreferences? trackLanguagePreferences,
+    TrueHdFallbackPolicy? trueHdFallbackPolicy,
+    AppPlatformCapabilities? capabilities,
+    ShadersController? shadersController,
+    Future<void> Function()? clearLocalPlaybackCache,
+    required PlayerRuntimePreferences runtimePreferences,
+  })  : _subtitlePreferences = subtitlePreferences ?? SubtitlePreferences(),
+        _trackLanguagePreferences =
+            trackLanguagePreferences ?? EmbeddedTrackLanguagePreferences(),
+        _trueHdFallbackPolicy =
+            trueHdFallbackPolicy ?? const TrueHdFallbackPolicy(),
+        _capabilities = capabilities ?? detectAppPlatform(),
+        _clearLocalPlaybackCache = clearLocalPlaybackCache,
+        _runtimePreferences = runtimePreferences,
+        shadersController =
+            shadersController ?? Modular.get<ShadersController>();
+
+  static const Duration _playerOpenTimeout = Duration(seconds: 25);
+
+  final SubtitlePreferences _subtitlePreferences;
+  final EmbeddedTrackLanguagePreferences _trackLanguagePreferences;
+  final TrueHdFallbackPolicy _trueHdFallbackPolicy;
+  final AppPlatformCapabilities _capabilities;
+  final Future<void> Function()? _clearLocalPlaybackCache;
+  final PlayerRuntimePreferences _runtimePreferences;
+  late final EmbeddedTrackCoordinator _embeddedTrackCoordinator =
+      EmbeddedTrackCoordinator(_trackLanguagePreferences);
+  final CloudPlaybackLeaseCoordinator _playbackLeaseCoordinator =
+      CloudPlaybackLeaseCoordinator();
+
+  final ShadersController shadersController;
+  late final Anime4kCoordinator _anime4kCoordinator = Anime4kCoordinator(
+    policy: const Anime4kPolicy(),
+    execute: _executeAnime4kDecision,
+  );
+
+  late int mediaId;
+  late int currentEpisode;
+  late int currentRoad;
+  late String referer;
+  String? coverUrl;
+
+  /// 视频比例类型
+  /// 1. AUTO
+  /// 2. COVER
+  /// 3. FILL
+  @observable
+  int aspectRatioType = 1;
+
+  @observable
+  Anime4kPreference anime4kPreference = Anime4kPreference.off;
+
+  @observable
+  Anime4kRuntimeState anime4kRuntimeState = Anime4kRuntimeState.off;
+
+  Timer? _anime4kLayoutDebounce;
+  Size _anime4kOutputPixels = Size.zero;
+
+  // 视频音量/亮度
+  @observable
+  double volume = -1;
+  @observable
+  double brightness = 0;
+
+  // 播放器界面控制
+  @observable
+  bool lockPanel = false;
+  @observable
+  bool showVideoController = true;
+  @observable
+  bool showSeekTime = false;
+  @observable
+  bool showBrightness = false;
+  @observable
+  bool showVolume = false;
+  @observable
+  bool showPlaySpeed = false;
+  @observable
+  bool brightnessSeeking = false;
+  @observable
+  bool volumeSeeking = false;
+  @observable
+  bool canHidePlayerPanel = true;
+
+  // 视频地址
+  String videoUrl = '';
+
+  // 播放器实体
+  Player? mediaPlayer;
+  VideoController? videoController;
+
+  PlaybackInitParams? _lastInitParams;
+  final PlayerMediaOperationCoordinator _mediaOperations =
+      PlayerMediaOperationCoordinator();
+  final PlayerLifecycleCoordinator _lifecycleOperations =
+      PlayerLifecycleCoordinator();
+  final PlayerResourceDisposer _resourceDisposer =
+      const PlayerResourceDisposer();
+  final Lock _playerInitLock = Lock();
+  bool _disposeRequested = false;
+  Future<void>? _disposeFuture;
+  String? _subtitleStorageKey;
+  bool _truehdAudioTrackFallbackAttempted = false;
+  bool _softwareVideoDecoderFallbackAttempted = false;
+  final PlayerDecoderRecoveryPolicy _decoderRecoveryPolicy =
+      PlayerDecoderRecoveryPolicy();
+  final EmbeddedTrackSelectionState _embeddedTrackSelection =
+      EmbeddedTrackSelectionState();
+  final SubtitleTrackSelectionState _subtitleTrackSelection =
+      SubtitleTrackSelectionState();
+  final TrackLanguageConfirmationState _trackLanguageConfirmationState =
+      TrackLanguageConfirmationState();
+
+  // 播放器面板状态
+  @observable
+  bool loading = true;
+  @observable
+  bool playing = false;
+  @observable
+  bool isBuffering = true;
+  @observable
+  bool completed = false;
+  @observable
+  Duration currentPosition = Duration.zero;
+  @observable
+  Duration buffer = Duration.zero;
+  @observable
+  Duration duration = Duration.zero;
+  @observable
+  double playerSpeed = 1.0;
+
+  bool hAenable = true;
+  late String hardwareDecoder;
+  String? videoRenderer;
+  bool anime4kSupported = true;
+  bool lowMemoryMode = false;
+  bool autoPlay = true;
+  bool playerDebugMode = false;
+  PlayerColorProfile colorProfile = PlayerColorProfile.automatic;
+  PlayerColorProfile effectiveColorProfile = PlayerColorProfile.automatic;
+  String? colorProfileFallbackReason;
+  String? _lastColorDiagnostic;
+  int buttonSkipTime = 80;
+  int arrowKeySkipTime = 10;
+
+  // 播放器实时状态
+  bool get hasActivePlayer => !_disposeRequested && mediaPlayer != null;
+
+  bool get anime4kShadersAvailable =>
+      anime4kSupported && shadersController.shadersDirectory != null;
+
+  PlayerRuntimeSnapshot? readRuntimeSnapshot() {
+    final player = mediaPlayer;
+    if (_disposeRequested || player == null) return null;
+    final state = player.state;
+    return PlayerRuntimeSnapshot(
+      playing: state.playing,
+      buffering: state.buffering,
+      completed: state.completed,
+      volume: state.volume,
+      position: state.position,
+      buffer: state.buffer,
+      duration: state.duration,
+    );
+  }
+
+  bool get playerPlaying => readRuntimeSnapshot()?.playing ?? false;
+  bool get playerBuffering => readRuntimeSnapshot()?.buffering ?? false;
+  bool get playerCompleted => readRuntimeSnapshot()?.completed ?? false;
+  double get playerVolume => readRuntimeSnapshot()?.volume ?? volume;
+  Duration get playerPosition =>
+      readRuntimeSnapshot()?.position ?? currentPosition;
+  Duration get playerBuffer => readRuntimeSnapshot()?.buffer ?? buffer;
+  Duration get playerDuration => readRuntimeSnapshot()?.duration ?? duration;
+
+  // 播放器调试信息
+  @observable
+  ObservableList<String> playerLog = ObservableList.of([]);
+  @observable
+  int playerWidth = 0;
+  @observable
+  int playerHeight = 0;
+  @observable
+  String playerVideoParams = '';
+  @observable
+  String playerAudioParams = '';
+  @observable
+  String playerPlaylist = '';
+  @observable
+  String playerAudioTracks = '';
+  @observable
+  String playerVideoTracks = '';
+  @observable
+  String playerAudioBitrate = '';
+
+  String sanitizePlayerDiagnostic(String value) => sanitizeMediaDiagnosticText(
+        value,
+        isLocalPlayback: isLocalPlayback,
+      );
+
+  String get playerDebugSource => sanitizePlayerDiagnostic(videoUrl);
+
+  String get playerDebugPlaylist => sanitizePlayerDiagnostic(playerPlaylist);
+
+  /// 播放器调试信息订阅
+  StreamSubscription<PlayerLog>? playerLogSubscription;
+  StreamSubscription<int?>? playerWidthSubscription;
+  StreamSubscription<int?>? playerHeightSubscription;
+  StreamSubscription<VideoParams>? playerVideoParamsSubscription;
+  StreamSubscription<AudioParams>? playerAudioParamsSubscription;
+  StreamSubscription<Playlist>? playerPlaylistSubscription;
+  StreamSubscription<Track>? playerTracksSubscription;
+  StreamSubscription<Tracks>? playerAvailableTracksSubscription;
+  StreamSubscription<double?>? playerAudioBitrateSubscription;
+  StreamSubscription<String>? playerErrorSubscription;
+
+  bool isLocalPlayback = false;
+  bool androidAutoEnterPip = false;
+  final LocalSubtitleMatcher _localSubtitleMatcher = LocalSubtitleMatcher();
+  final LocalSubtitleImporter _localSubtitleImporter = LocalSubtitleImporter();
+  bool get canImportSubtitleToVideoDirectory =>
+      isLocalPlayback &&
+      _localSubtitleImporter.supportsVideoDirectory(videoPath: videoUrl);
+  @observable
+  String currentSubtitlePath = '';
+  @observable
+  String lastSubtitlePath = '';
+  @observable
+  ObservableList<String> subtitleCandidates = ObservableList.of([]);
+  @observable
+  double subtitleFontSize = SubtitleStyleSettings.defaultFontSize;
+  @observable
+  int subtitleColorValue = SubtitleStyleSettings.defaultColorValue;
+  @observable
+  int subtitleBorderColorValue = SubtitleStyleSettings.defaultBorderColorValue;
+  @observable
+  double subtitleBorderSize = SubtitleStyleSettings.defaultBorderSize;
+  @observable
+  bool subtitleShadowEnabled = SubtitleStyleSettings.defaultShadowEnabled;
+  @observable
+  double subtitleShadowOffset = SubtitleStyleSettings.defaultShadowOffset;
+  @observable
+  double subtitlePosition = SubtitleStyleSettings.defaultPosition;
+  @observable
+  bool subtitleForceStyle = SubtitleStyleSettings.defaultForceStyle;
+  @observable
+  double subtitleDelaySeconds = 0.0;
+  @observable
+  ObservableList<EmbeddedTrackInfo> availableAudioTracks =
+      ObservableList.of([]);
+  @observable
+  ObservableList<EmbeddedTrackInfo> availableEmbeddedSubtitleTracks =
+      ObservableList.of([]);
+  @observable
+  ObservableList<PendingTrackLanguage> pendingTrackLanguages =
+      ObservableList.of([]);
+  @observable
+  int trackLanguageConfirmationRevision = 0;
+  @observable
+  String selectedAudioTrackId = '';
+  @observable
+  String selectedEmbeddedSubtitleTrackId = '';
+
+  SubtitleStyleSettings get subtitleStyleSettings => SubtitleStyleSettings(
+        fontSize: subtitleFontSize,
+        colorValue: subtitleColorValue,
+        borderColorValue: subtitleBorderColorValue,
+        borderSize: subtitleBorderSize,
+        shadowEnabled: subtitleShadowEnabled,
+        shadowOffset: subtitleShadowOffset,
+        position: subtitlePosition,
+        forceStyle: subtitleForceStyle,
+      );
+
+  PlayerLifecycleToken activatePlaybackLifecycle() {
+    _disposeRequested = false;
+    _disposeFuture = null;
+    return _lifecycleOperations.activate();
+  }
+
+  Future<void> init(
+    PlaybackInitParams params, {
+    required PlayerLifecycleToken lifecycleToken,
+  }) {
+    if (!_lifecycleOperations.isCurrent(lifecycleToken) || _disposeRequested) {
+      return _playbackLeaseCoordinator.reject(params.lease);
+    }
+    final token = _mediaOperations.beginMedia(params.stableMediaKey);
+    return _playerInitLock.synchronized(
+      () => _init(params, token, lifecycleToken),
+    );
+  }
+
+  Future<void> _init(
+    PlaybackInitParams params,
+    PlayerMediaToken mediaToken,
+    PlayerLifecycleToken lifecycleToken,
+  ) async {
+    final previousParams = _lastInitParams;
+    var adopted = false;
+    var replacementAborted = false;
+    try {
+      final initialized = await _initializeMedia(
+        params,
+        mediaToken,
+        lifecycleToken,
+      );
+      if (!initialized ||
+          !_isMediaOperationActive(mediaToken, lifecycleToken)) {
+        _lastInitParams = previousParams;
+        return;
+      }
+      await _playbackLeaseCoordinator.adopt(params.lease);
+      adopted = true;
+    } on Object {
+      _lastInitParams = previousParams;
+      replacementAborted = true;
+      await _playbackLeaseCoordinator.abortReplacement(params.lease);
+      rethrow;
+    } finally {
+      if (!adopted && !replacementAborted) {
+        await _playbackLeaseCoordinator.reject(params.lease);
+      }
+    }
+  }
+
+  Future<bool> _initializeMedia(
+    PlaybackInitParams params,
+    PlayerMediaToken mediaToken,
+    PlayerLifecycleToken lifecycleToken,
+  ) async {
+    if (!_isMediaOperationActive(mediaToken, lifecycleToken)) return false;
+    final bool isNewMedia = _lastInitParams?.videoUrl != params.videoUrl;
+    if (isNewMedia) {
+      _truehdAudioTrackFallbackAttempted = false;
+      _softwareVideoDecoderFallbackAttempted = false;
+      _decoderRecoveryPolicy.reset();
+      _resetEmbeddedTrackState();
+    }
+    _lastInitParams = params;
+    _embeddedTrackCoordinator.beginMedia(_currentTrackLanguageMediaKey());
+    videoUrl = params.videoUrl;
+    isLocalPlayback = params.isLocalPlayback;
+    _subtitleStorageKey = params.subtitleStorageKey;
+    _loadSubtitleDelayForCurrentVideo();
+    mediaId = params.mediaId;
+    currentEpisode = params.episode;
+    currentRoad = params.currentRoad;
+    referer = params.referer;
+    _applyStoredSubtitleStyle();
+    if (isNewMedia) {
+      lastSubtitlePath = params.subtitlePath ?? '';
+    }
+    _setCurrentSubtitlePath(params.subtitlePath ?? '');
+    if (!params.isLocalPlayback) {
+      subtitleCandidates.clear();
+    }
+
+    AppLogger().i(
+      'PlayerController: ${params.isLocalPlayback ? "local" : "online"} '
+      'playback: ${sanitizeMediaDescription(params.videoUrl, isLocalPlayback: params.isLocalPlayback)} '
+      'route=${params.networkRoute.name}',
+    );
+
+    playing = false;
+    loading = true;
+    isBuffering = true;
+    currentPosition = Duration.zero;
+    buffer = Duration.zero;
+    duration = Duration.zero;
+    completed = false;
+    final runtimeSettings = _runtimePreferences.load();
+    androidAutoEnterPip = runtimeSettings.androidAutoEnterPip;
+    playerSpeed = runtimeSettings.playSpeed;
+    aspectRatioType = runtimeSettings.aspectRatioType;
+    buttonSkipTime = runtimeSettings.buttonSkipTime;
+    arrowKeySkipTime = runtimeSettings.arrowKeySkipTime;
+    await _disposePlayerResources();
+    if (!_isMediaOperationActive(mediaToken, lifecycleToken)) return false;
+    int episodeFromTitle = 0;
+    try {
+      episodeFromTitle = Utils.extractEpisodeNumber(params.episodeTitle);
+    } catch (e) {
+      AppLogger().e(
+          'PlayerController: failed to extract episode number from title',
+          error: e);
+    }
+    if (episodeFromTitle == 0) {
+      episodeFromTitle = params.episode;
+    }
+    if (params.isLocalPlayback) {
+      await refreshSubtitleCandidates();
+    }
+    try {
+      mediaPlayer = await createVideoController(
+        params.httpHeaders,
+        mediaToken: mediaToken,
+        lifecycleToken: lifecycleToken,
+        initParams: params,
+        offset: params.offset,
+        subtitlePath: params.subtitlePath,
+      );
+      if (!_isMediaOperationActive(mediaToken, lifecycleToken)) {
+        await _disposePlayerResources();
+        return false;
+      }
+
+      volume = volume != -1 ? volume : 100;
+      await setVolume(volume);
+      setPlaybackSpeed(playerSpeed);
+      AppLogger().i('PlayerController: video initialized');
+      if (!_isMediaOperationActive(mediaToken, lifecycleToken)) {
+        await _disposePlayerResources();
+        return false;
+      }
+      loading = false;
+
+      coverUrl = params.coverUrl;
+      return true;
+    } catch (e) {
+      if (e is _PlayerInitializationCancelled) return false;
+      loading = false;
+      isBuffering = false;
+      AppLogger().e('PlayerController: failed to initialize video', error: e);
+      try {
+        await _disposePlayerResources().timeout(const Duration(seconds: 5));
+      } catch (disposeError) {
+        AppLogger().w(
+          'PlayerController: failed to dispose after init error',
+          error: disposeError,
+        );
+      }
+      rethrow;
+    }
+  }
+
+  Future<void> setupPlayerDebugInfoSubscription() async {
+    await playerLogSubscription?.cancel();
+    playerLogSubscription = mediaPlayer!.stream.log.listen((event) {
+      _decoderRecoveryPolicy.recordLog(event);
+      final safeLog = sanitizePlayerDiagnostic(event.toString());
+      writePlayerLog('MPV: $safeLog');
+      if (playerDebugMode) {
+        playerLog.add(safeLog);
+      }
+    });
+    await playerWidthSubscription?.cancel();
+    playerWidthSubscription = mediaPlayer!.stream.width.listen((event) {
+      playerWidth = event ?? 0;
+      _scheduleAnime4kEvaluation();
+    });
+    await playerHeightSubscription?.cancel();
+    playerHeightSubscription = mediaPlayer!.stream.height.listen((event) {
+      playerHeight = event ?? 0;
+      _scheduleAnime4kEvaluation();
+    });
+    await playerVideoParamsSubscription?.cancel();
+    playerVideoParamsSubscription =
+        mediaPlayer!.stream.videoParams.listen((event) {
+      playerVideoParams = event.toString();
+      _logPlayerColorDiagnostic(event);
+    });
+    await playerAudioParamsSubscription?.cancel();
+    playerAudioParamsSubscription =
+        mediaPlayer!.stream.audioParams.listen((event) {
+      playerAudioParams = event.toString();
+    });
+    await playerPlaylistSubscription?.cancel();
+    playerPlaylistSubscription = mediaPlayer!.stream.playlist.listen((event) {
+      playerPlaylist = sanitizePlayerDiagnostic(event.toString());
+    });
+    await playerTracksSubscription?.cancel();
+    playerTracksSubscription = mediaPlayer!.stream.track.listen((event) {
+      selectedAudioTrackId = event.audio.id;
+      if (!event.subtitle.uri && !event.subtitle.data) {
+        selectedEmbeddedSubtitleTrackId =
+            event.subtitle.id == 'no' || event.subtitle.id == 'auto'
+                ? ''
+                : event.subtitle.id;
+      }
+    });
+    await playerAvailableTracksSubscription?.cancel();
+    playerAvailableTracksSubscription =
+        mediaPlayer!.stream.tracks.listen((event) {
+      playerAudioTracks = event.audio.toString();
+      playerVideoTracks = event.video.toString();
+      _updateEmbeddedTracks(event);
+      unawaited(_selectDefaultEmbeddedTracks());
+    });
+    await playerAudioBitrateSubscription?.cancel();
+    playerAudioBitrateSubscription =
+        mediaPlayer!.stream.audioBitrate.listen((event) {
+      playerAudioBitrate = event.toString();
+    });
+  }
+
+  Future<void> cancelPlayerDebugInfoSubscription() async {
+    await playerLogSubscription?.cancel();
+    await playerWidthSubscription?.cancel();
+    await playerHeightSubscription?.cancel();
+    await playerVideoParamsSubscription?.cancel();
+    await playerAudioParamsSubscription?.cancel();
+    await playerPlaylistSubscription?.cancel();
+    await playerTracksSubscription?.cancel();
+    await playerAvailableTracksSubscription?.cancel();
+    await playerAudioBitrateSubscription?.cancel();
+  }
+
+  Future<Player> createVideoController(Map<String, String> httpHeaders,
+      {required PlayerMediaToken mediaToken,
+      required PlayerLifecycleToken lifecycleToken,
+      required PlaybackInitParams initParams,
+      int offset = 0,
+      String? subtitlePath}) async {
+    final runtimeSettings = _runtimePreferences.load();
+    anime4kPreference = runtimeSettings.anime4kPreference;
+    hAenable = runtimeSettings.hardwareAccelerationEnabled;
+    hardwareDecoder = runtimeSettings.hardwareDecoder;
+    videoRenderer = runtimeSettings.videoRenderer;
+    anime4kSupported = runtimeSettings.anime4kSupported;
+    anime4kRuntimeState = anime4kPreference == Anime4kPreference.off
+        ? Anime4kRuntimeState.off
+        : anime4kShadersAvailable
+            ? Anime4kRuntimeState.waitingForSize
+            : Anime4kRuntimeState.incompatible;
+    _anime4kCoordinator.reset();
+    autoPlay = runtimeSettings.autoPlay;
+    lowMemoryMode = runtimeSettings.lowMemoryMode;
+    playerDebugMode = runtimeSettings.debugMode;
+    colorProfile = _capabilities.isWindows
+        ? runtimeSettings.colorProfile
+        : PlayerColorProfile.automatic;
+    effectiveColorProfile = PlayerColorProfile.automatic;
+    colorProfileFallbackReason = null;
+    _lastColorDiagnostic = null;
+
+    final cachePolicy = CloudPlaybackCachePolicy.forTransport(
+      initParams.transport,
+      capabilities: _capabilities,
+      lowMemoryMode: lowMemoryMode,
+    );
+    mediaPlayer = Player(
+      configuration: PlayerConfiguration(
+        bufferSize: cachePolicy.playerBufferSize ??
+            (lowMemoryMode ? 15 * 1024 * 1024 : 1500 * 1024 * 1024),
+        osc: false,
+        libass: true,
+        libassAndroidFont: 'assets/fonts/MiSans-Regular.ttf',
+        libassAndroidFontName: 'MiSans',
+        logLevel: MPVLogLevel.v,
+      ),
+    );
+    if (!_isMediaOperationActive(mediaToken, lifecycleToken)) {
+      await _disposePlayerResources();
+      throw const _PlayerInitializationCancelled();
+    }
+
+    playerLog.clear();
+    await setupPlayerDebugInfoSubscription();
+    if (!_isMediaOperationActive(mediaToken, lifecycleToken)) {
+      await _disposePlayerResources();
+      throw const _PlayerInitializationCancelled();
+    }
+
+    var pp = mediaPlayer!.platform as NativePlayer;
+    await _prepareSubtitleTrackState(pp);
+    final colorDecision = await PlayerColorProfileApplier(
+      pp.setProperty,
+    ).apply(
+      colorProfile,
+      hdrOutputSupported: _capabilities.isWindows,
+    );
+    effectiveColorProfile = colorDecision.effective;
+    colorProfileFallbackReason = colorDecision.fallbackReason;
+    if (colorDecision.isFallback) {
+      AppLogger().w(
+        'PlayerColor: requested=${colorProfile.name} '
+        'effective=${effectiveColorProfile.name} '
+        'reason=${colorDecision.fallbackReason}',
+      );
+    } else {
+      AppLogger().i(
+        'PlayerColor: requested=${colorProfile.name} '
+        'effective=${effectiveColorProfile.name}',
+      );
+    }
+    // media-kit 默认启用硬盘作为双重缓存，这可以维持大缓存的前提下减轻内存压力
+    // media-kit 内部硬盘缓存目录按照 Linux 配置，这导致该功能在其他平台上被损坏
+    // 该设置可以在所有平台上正确启用双重缓存
+    await pp.setProperty("demuxer-cache-dir", await Utils.getPlayerTempPath());
+    await pp.setProperty("af", "scaletempo2=max-speed=8");
+    if (_capabilities.isAndroid) {
+      await pp.setProperty('demuxer-mkv-subtitle-preroll', 'yes');
+      await pp.setProperty('demuxer-mkv-subtitle-preroll-secs', '10');
+    }
+    await _prepareAndroidAudioOutput(pp, trueHd: true);
+    for (final property in cachePolicy.mpvProperties.entries) {
+      await pp.setProperty(property.key, property.value);
+    }
+    // 设置 HTTP 代理
+    final bool proxyEnable = runtimeSettings.proxyEnabled;
+    if (shouldApplyPlayerProxy(
+      proxyEnabled: proxyEnable,
+      networkRoute: initParams.networkRoute,
+    )) {
+      final String proxyUrl = runtimeSettings.proxyUrl;
+      final formattedProxy = ProxyUtils.getFormattedProxyUrl(proxyUrl);
+      if (formattedProxy != null) {
+        await pp.setProperty("http-proxy", formattedProxy);
+        AppLogger().i('Player: HTTP 代理设置成功 $formattedProxy');
+      }
+    }
+
+    await mediaPlayer!.setAudioTrack(
+      AudioTrack.auto(),
+    );
+
+    videoController ??= VideoController(
+      mediaPlayer!,
+      configuration: VideoControllerConfiguration(
+        vo: videoRenderer,
+        enableHardwareAcceleration: hAenable,
+        hwdec: hAenable ? hardwareDecoder : 'no',
+      ),
+    );
+    AppLogger().i(
+      'PlayerController: renderer=${videoRenderer ?? "platform-default"} '
+      'hwdec=${hAenable ? hardwareDecoder : "no"}',
+    );
+    mediaPlayer!.setPlaylistMode(PlaylistMode.none);
+
+    // error handle
+    final bool showPlayerError = runtimeSettings.showPlayerError;
+    await playerErrorSubscription?.cancel();
+    playerErrorSubscription = mediaPlayer!.stream.error.listen((event) async {
+      if (!_isMediaOperationActive(mediaToken, lifecycleToken)) return;
+      final errorStr = event.toString();
+      final safeError = sanitizePlayerDiagnostic(errorStr);
+      final decoderFailure = _decoderRecoveryPolicy.classify(errorStr);
+      if (await _refreshExpiredCloudLink(
+        errorStr,
+        mediaToken,
+        lifecycleToken,
+        initParams,
+      )) {
+        return;
+      }
+      if (!_isMediaOperationActive(mediaToken, lifecycleToken)) return;
+      if (decoderFailure == PlayerDecoderFailureKind.video &&
+          await _handleAndroidVideoDecoderError(
+            errorStr,
+            mediaToken,
+            lifecycleToken,
+          )) {
+        return;
+      }
+      if (!_isMediaOperationActive(mediaToken, lifecycleToken)) return;
+      // TrueHD 解码失败时只切换已有的兼容音轨，不重建视频解码器。
+      if (decoderFailure != PlayerDecoderFailureKind.video &&
+          await _handleTrueHdPlaybackError(
+            errorStr,
+            mediaToken,
+            lifecycleToken,
+          )) {
+        return;
+      }
+      if (!_isMediaOperationActive(mediaToken, lifecycleToken)) return;
+      if (!_decoderRecoveryPolicy.shouldReport(errorStr)) return;
+      if (showPlayerError) {
+        if (initParams.refreshCloudPlayback != null &&
+            shouldRefreshCloudLink(errorStr)) {
+          AppDialog.showToast(
+            message: cloudPlaybackFailureMessage(
+              initParams.cloudProviderName,
+            ),
+            duration: const Duration(seconds: 5),
+            showActionButton: true,
+          );
+        } else if (errorStr.contains('Failed to open') && playerBuffering) {
+          AppDialog.showToast(
+              message: '加载失败, 请尝试更换其他视频来源', showActionButton: true);
+        } else {
+          AppDialog.showToast(
+              message: '播放器内部错误，请稍后重试',
+              duration: const Duration(seconds: 5),
+              showActionButton: true);
+        }
+      }
+      AppLogger().e(
+        'PlayerController: player error for '
+        '${sanitizeMediaDescription(initParams.videoUrl, isLocalPlayback: initParams.isLocalPlayback)} '
+        'decoder=${decoderFailure.name} error=$safeError',
+      );
+    });
+
+    await applySubtitleStyle(save: false);
+    final playableUri = MediaUriUtils.toPlayableUri(
+      videoUrl,
+      isLocalPlayback: isLocalPlayback,
+    );
+    if (!_isMediaOperationActive(mediaToken, lifecycleToken)) {
+      await _disposePlayerResources();
+      throw const _PlayerInitializationCancelled();
+    }
+    await mediaPlayer!
+        .open(
+          Media(playableUri,
+              start: Duration(seconds: offset), httpHeaders: httpHeaders),
+          play: autoPlay,
+        )
+        .timeout(
+          _playerOpenTimeout,
+          onTimeout: () => throw TimeoutException(
+            '播放器打开超时，请检查视频源或本地文件是否可播放',
+            _playerOpenTimeout,
+          ),
+        );
+    if (!_isMediaOperationActive(mediaToken, lifecycleToken)) {
+      await _disposePlayerResources();
+      throw const _PlayerInitializationCancelled();
+    }
+    if (subtitlePath != null && subtitlePath.isNotEmpty) {
+      await loadExternalSubtitle(
+        subtitlePath,
+        displayName: initParams.subtitleDisplayName,
+      );
+    }
+    await applySubtitleStyle(save: false);
+    await _syncSubtitleDelayToPlayer();
+    _scheduleAnime4kEvaluation();
+
+    return mediaPlayer!;
+  }
+
+  void _logPlayerColorDiagnostic(VideoParams params) {
+    final message = 'PlayerColor: input '
+        'primaries=${params.primaries ?? "unknown"} '
+        'transfer=${params.gamma ?? "unknown"} '
+        'matrix=${params.colormatrix ?? "unknown"} '
+        'levels=${params.colorlevels ?? "unknown"} '
+        'signalPeak=${params.sigPeak?.toStringAsFixed(3) ?? "unknown"} '
+        'light=${params.light ?? "unknown"} '
+        'hwdec=${hAenable ? hardwareDecoder : "no"} '
+        'profile=${effectiveColorProfile.name}';
+    if (_lastColorDiagnostic == message) return;
+    _lastColorDiagnostic = message;
+    AppLogger().i(message);
+  }
+
+  Future<bool> _handleAndroidVideoDecoderError(
+    String errorStr,
+    PlayerMediaToken mediaToken,
+    PlayerLifecycleToken lifecycleToken,
+  ) async {
+    final lower = errorStr.toLowerCase();
+    final codecOpenFailed = lower.contains('could not open codec') ||
+        lower.contains('failed to open codec') ||
+        lower.contains('failed to initialize decoder');
+    if (!_capabilities.isAndroid ||
+        !hAenable ||
+        _softwareVideoDecoderFallbackAttempted ||
+        !codecOpenFailed ||
+        !_isMediaOperationActive(mediaToken, lifecycleToken)) {
+      return false;
+    }
+    final platform = mediaPlayer?.platform;
+    if (platform is! NativePlayer) return false;
+
+    _softwareVideoDecoderFallbackAttempted = true;
+    try {
+      await platform.setProperty('hwdec', 'no');
+      await platform.command(const ['video-reload']);
+      if (!_isMediaOperationActive(mediaToken, lifecycleToken)) return true;
+      hAenable = false;
+      hardwareDecoder = 'no';
+      AppLogger().w(
+        'PlayerController: video decoder failed, reloaded with software decoding',
+      );
+      AppDialog.showToast(
+        message: '硬件解码不兼容，已自动切换为软件解码',
+        duration: const Duration(seconds: 3),
+      );
+      return true;
+    } on Object catch (error, stackTrace) {
+      AppLogger().e(
+        'PlayerController: failed to reload video with software decoding',
+        error: error,
+        stackTrace: stackTrace,
+      );
+      return false;
+    }
+  }
+
+  Future<bool> _handleTrueHdPlaybackError(
+    String errorStr,
+    PlayerMediaToken mediaToken,
+    PlayerLifecycleToken lifecycleToken,
+  ) async {
+    if (!_isMediaOperationActive(mediaToken, lifecycleToken) ||
+        !_isTrueHdRelatedPlaybackError(errorStr) ||
+        _lastInitParams == null) {
+      return false;
+    }
+
+    if (!_truehdAudioTrackFallbackAttempted) {
+      _truehdAudioTrackFallbackAttempted = true;
+      if (await _switchToCompatibleAudioTrackForTrueHd()) {
+        return true;
+      }
+      if (!_isMediaOperationActive(mediaToken, lifecycleToken)) return true;
+      AppDialog.showToast(
+        message: '当前播放器组件无法解码此音轨，请导出诊断日志',
+        duration: const Duration(seconds: 5),
+        showActionButton: true,
+      );
+    }
+    return true;
+  }
+
+  bool _isTrueHdRelatedPlaybackError(String errorStr) {
+    final player = mediaPlayer;
+    return _trueHdFallbackPolicy.isRelatedError(
+      errorStr,
+      player?.state.tracks.audio ?? const <AudioTrack>[],
+    );
+  }
+
+  Future<bool> _switchToCompatibleAudioTrackForTrueHd() async {
+    if (!_embeddedTrackSelection.canAutomaticallySelectAudio) {
+      AppDialog.showToast(message: '当前音轨播放失败，请手动选择其他音轨或导出诊断日志');
+      return false;
+    }
+    final player = mediaPlayer;
+    if (player == null) return false;
+    final currentId = player.state.track.audio.id;
+    final fallbackTrack = _trueHdFallbackPolicy.chooseFallback(
+      player.state.tracks.audio,
+      currentTrackId: currentId,
+    );
+
+    if (fallbackTrack == null) {
+      AppLogger()
+          .w('PlayerController: no compatible non-TrueHD audio track found');
+      return false;
+    }
+
+    try {
+      await _prepareAudioTrackOutput(player, fallbackTrack);
+      await player.setAudioTrack(fallbackTrack);
+      AppLogger().w(
+          'PlayerController: switched from TrueHD to audio track ${fallbackTrack.id}');
+      AppDialog.showToast(
+        message: 'TrueHD 音轨播放失败，已切换到兼容音轨',
+        duration: const Duration(seconds: 3),
+      );
+      return true;
+    } catch (e) {
+      AppLogger()
+          .e('PlayerController: failed to switch TrueHD audio track', error: e);
+      return false;
+    }
+  }
+
+  Future<bool> loadExternalSubtitle(
+    String? subtitlePath, {
+    String? displayName,
+  }) async {
+    if (subtitlePath == null || subtitlePath.isEmpty) return false;
+    if (!LocalSubtitleMatcher.isSupportedSubtitlePath(subtitlePath)) {
+      return false;
+    }
+    _subtitleTrackSelection.markManualSelection();
+    try {
+      await _clearSubtitleTrackForSwitch();
+      final player = mediaPlayer;
+      if (player == null) return false;
+      await player.setSubtitleTrack(
+        SubtitleTrack.uri(
+          MediaUriUtils.toPlayableUri(
+            subtitlePath,
+            isLocalPlayback: true,
+          ),
+          title: displayName?.trim().isNotEmpty == true
+              ? displayName!.trim()
+              : p.basename(subtitlePath),
+          language: 'auto',
+        ),
+      );
+      final pp = player.platform;
+      if (pp is NativePlayer) {
+        await _setFlutterSubtitleMode(pp);
+      }
+      _setCurrentSubtitlePath(subtitlePath);
+      selectedEmbeddedSubtitleTrackId = '';
+      await applySubtitleStyle(save: false);
+      AppLogger().i('PlayerController: loaded subtitle $subtitlePath');
+      return true;
+    } catch (e) {
+      AppLogger().w('PlayerController: failed to load subtitle $subtitlePath',
+          error: e);
+      return false;
+    }
+  }
+
+  Future<void> _disableSubtitleTrack({bool clearCurrentPath = false}) async {
+    if (clearCurrentPath) {
+      _setCurrentSubtitlePath('');
+    }
+    selectedEmbeddedSubtitleTrackId = '';
+    final player = mediaPlayer;
+    if (player == null) return;
+    try {
+      await player.setSubtitleTrack(SubtitleTrack.no());
+    } catch (e) {
+      AppLogger().w(
+          'PlayerController: failed to disable media_kit subtitle track',
+          error: e);
+    }
+    final pp = player.platform;
+    if (pp is NativePlayer) {
+      await _trySetNativeSubtitleProperty(pp, 'sub-visibility', 'no');
+      await _trySetNativeSubtitleProperty(pp, 'secondary-sub-visibility', 'no');
+      await _trySetNativeSubtitleProperty(pp, 'sid', 'no');
+      await _trySetNativeSubtitleProperty(pp, 'secondary-sid', 'no');
+    }
+  }
+
+  Future<void> _clearSubtitleTrackForSwitch() {
+    return _disableSubtitleTrack(clearCurrentPath: true);
+  }
+
+  Future<void> _prepareSubtitleTrackState(NativePlayer player) async {
+    await _trySetNativeSubtitleProperty(player, 'sub-auto', 'no');
+    await _trySetNativeSubtitleProperty(player, 'sid', 'no');
+    await _trySetNativeSubtitleProperty(player, 'secondary-sid', 'no');
+    await _setFlutterSubtitleMode(player);
+  }
+
+  Future<void> _prepareAndroidAudioOutput(
+    NativePlayer player, {
+    required bool trueHd,
+  }) async {
+    if (!_capabilities.isAndroid) return;
+    await player.setProperty(
+      'audio-channels',
+      trueHd ? 'stereo' : 'auto-safe',
+    );
+    await player.setProperty(
+      'ad-lavc-downmix',
+      trueHd ? 'yes' : 'no',
+    );
+  }
+
+  Future<void> _prepareAudioTrackOutput(
+    Player player,
+    AudioTrack track,
+  ) async {
+    final platform = player.platform;
+    if (platform is! NativePlayer) return;
+    await _prepareAndroidAudioOutput(
+      platform,
+      trueHd: _trueHdFallbackPolicy.isTrueHd(track),
+    );
+  }
+
+  @action
+  Future<bool> selectAudioTrack(String trackId, {bool manual = true}) async {
+    final player = mediaPlayer;
+    if (player == null) return false;
+    final track = player.state.tracks.audio
+        .where((item) => item.id == trackId)
+        .firstOrNull;
+    if (track == null) return false;
+    final previousId = selectedAudioTrackId;
+    try {
+      await _prepareAudioTrackOutput(player, track);
+      await player.setAudioTrack(track);
+      selectedAudioTrackId = track.id;
+      if (manual) _embeddedTrackSelection.markAudioSelectedManually();
+      AppLogger().i('PlayerController: selected audio track ${track.id}');
+      return true;
+    } catch (e) {
+      selectedAudioTrackId = previousId;
+      AppLogger().e(
+          'PlayerController: failed to select audio track ${track.id}',
+          error: e);
+      AppDialog.showToast(message: '音轨切换失败');
+      return false;
+    }
+  }
+
+  @action
+  Future<bool> selectEmbeddedSubtitleTrack(String trackId,
+      {bool manual = true}) async {
+    final player = mediaPlayer;
+    if (player == null) return false;
+    final track = player.state.tracks.subtitle
+        .where((item) => item.id == trackId && !item.uri && !item.data)
+        .firstOrNull;
+    if (track == null) return false;
+    final previousId = selectedEmbeddedSubtitleTrackId;
+    if (manual) {
+      _subtitleTrackSelection.markManualSelection();
+    }
+    try {
+      await _clearSubtitleTrackForSwitch();
+      await player.setSubtitleTrack(track);
+      final platform = player.platform;
+      if (platform is NativePlayer) {
+        await _trySetNativeSubtitleProperty(platform, 'sub-visibility', 'yes');
+        await _trySetNativeSubtitleProperty(platform, 'secondary-sid', 'no');
+        await _trySetNativeSubtitleProperty(
+          platform,
+          'secondary-sub-visibility',
+          'no',
+        );
+        await _trySetNativeSubtitleProperty(platform, 'sid', track.id);
+      }
+      selectedEmbeddedSubtitleTrackId = track.id;
+      AppLogger().i('PlayerController: selected embedded subtitle ${track.id}');
+      return true;
+    } catch (e) {
+      selectedEmbeddedSubtitleTrackId = previousId;
+      AppLogger().e(
+        'PlayerController: failed to select embedded subtitle ${track.id}',
+        error: e,
+      );
+      AppDialog.showToast(message: '字幕切换失败');
+      return false;
+    }
+  }
+
+  void _resetEmbeddedTrackState() {
+    _embeddedTrackSelection.reset();
+    _subtitleTrackSelection.reset();
+    _trackLanguageConfirmationState.reset();
+    trackLanguageConfirmationRevision++;
+    availableAudioTracks.clear();
+    availableEmbeddedSubtitleTracks.clear();
+    pendingTrackLanguages.clear();
+    selectedAudioTrackId = '';
+    selectedEmbeddedSubtitleTrackId = '';
+  }
+
+  String _currentTrackLanguageMediaKey() {
+    final stable = _lastInitParams?.stableMediaKey?.trim();
+    if (stable != null && stable.isNotEmpty) return stable;
+    final subtitleKey = _subtitleStorageKey?.trim();
+    if (subtitleKey != null && subtitleKey.isNotEmpty) return subtitleKey;
+    return videoUrl.trim();
+  }
+
+  String _fingerprintForTrack(String mediaKey, EmbeddedTrackInfo track) =>
+      _embeddedTrackCoordinator.fingerprintForMedia(mediaKey, track);
+
+  EmbeddedTrackInfo _applyStoredTrackLanguage(
+    String mediaKey,
+    EmbeddedTrackInfo track,
+  ) {
+    final choice = _embeddedTrackCoordinator.loadChoice(track);
+    return choice == null ? track : track.withLanguage(choice);
+  }
+
+  PendingTrackLanguage? pendingTrackLanguageFor(EmbeddedTrackInfo track) {
+    final fingerprint = _fingerprintForTrack(
+      _currentTrackLanguageMediaKey(),
+      track,
+    );
+    for (final pending in pendingTrackLanguages) {
+      if (pending.fingerprint == fingerprint) return pending;
+    }
+    return null;
+  }
+
+  PendingTrackLanguage _pendingTrackLanguage(
+    String mediaKey,
+    EmbeddedTrackInfo track,
+  ) =>
+      PendingTrackLanguage(
+        fingerprint: _fingerprintForTrack(mediaKey, track),
+        type: track.type,
+        trackId: track.id,
+        codecLabel: track.originalCodec,
+        title: track.originalTitle,
+      );
+
+  @action
+  void _updateEmbeddedTracks(Tracks tracks) {
+    final mediaKey = _currentTrackLanguageMediaKey();
+    final audio = tracks.audio
+        .where((track) => track.id != 'auto' && track.id != 'no' && !track.uri)
+        .map(EmbeddedTrackInfo.fromAudio)
+        .map((track) => _applyStoredTrackLanguage(mediaKey, track))
+        .toList(growable: false);
+    final subtitles = tracks.subtitle
+        .where((track) =>
+            track.id != 'auto' && track.id != 'no' && !track.uri && !track.data)
+        .map(EmbeddedTrackInfo.fromSubtitle)
+        .map((track) => _applyStoredTrackLanguage(mediaKey, track))
+        .toList(growable: false);
+    final pending = <PendingTrackLanguage>[
+      for (final track in [...audio, ...subtitles])
+        if (!track.isLanguageResolved) _pendingTrackLanguage(mediaKey, track),
+    ];
+    availableAudioTracks
+      ..clear()
+      ..addAll(audio);
+    availableEmbeddedSubtitleTracks
+      ..clear()
+      ..addAll(subtitles);
+    pendingTrackLanguages
+      ..clear()
+      ..addAll(pending);
+    if (pending.isNotEmpty) {
+      trackLanguageConfirmationRevision =
+          _trackLanguageConfirmationState.begin(mediaKey, pending);
+    }
+    AppLogger().i(
+      'PlayerController: detected ${availableAudioTracks.length} audio tracks and '
+      '${availableEmbeddedSubtitleTracks.length} embedded subtitle tracks',
+    );
+  }
+
+  void _applyConfirmedTrackLanguages(
+    String mediaKey,
+    Map<String, TrackLanguageChoice> choices,
+  ) {
+    EmbeddedTrackInfo resolve(EmbeddedTrackInfo track) {
+      final choice = choices[_fingerprintForTrack(mediaKey, track)];
+      return choice == null ? track : track.withLanguage(choice);
+    }
+
+    final audio = availableAudioTracks.map(resolve).toList(growable: false);
+    final subtitles =
+        availableEmbeddedSubtitleTracks.map(resolve).toList(growable: false);
+    availableAudioTracks
+      ..clear()
+      ..addAll(audio);
+    availableEmbeddedSubtitleTracks
+      ..clear()
+      ..addAll(subtitles);
+  }
+
+  @action
+  Future<String?> confirmTrackLanguages(
+    int revision,
+    Map<String, TrackLanguageChoice> choices,
+  ) async {
+    final mediaKey = _currentTrackLanguageMediaKey();
+    if (!_trackLanguageConfirmationState.canApply(revision, mediaKey)) {
+      return null;
+    }
+    try {
+      for (final pending in pendingTrackLanguages) {
+        final choice = choices[pending.fingerprint];
+        if (choice == null) return '请为每条轨道选择语言';
+        await _trackLanguagePreferences.save(
+          pending.fingerprint,
+          choice.confirmedByUser(),
+        );
+        if (!_trackLanguageConfirmationState.canApply(revision, mediaKey)) {
+          return null;
+        }
+      }
+      _applyConfirmedTrackLanguages(mediaKey, choices);
+      pendingTrackLanguages.clear();
+      await _selectDefaultEmbeddedTracks();
+      return null;
+    } on Object {
+      if (!_trackLanguageConfirmationState.canApply(revision, mediaKey)) {
+        return null;
+      }
+      _applyConfirmedTrackLanguages(mediaKey, choices);
+      pendingTrackLanguages.clear();
+      await _selectDefaultEmbeddedTracks();
+      return '语言设置未能保存，下次可能需要重新确认';
+    }
+  }
+
+  @action
+  Future<String?> confirmTrackLanguage(
+    int revision,
+    String fingerprint,
+    TrackLanguageChoice choice,
+  ) async {
+    final mediaKey = _currentTrackLanguageMediaKey();
+    if (!_trackLanguageConfirmationState.canApply(revision, mediaKey)) {
+      return null;
+    }
+    final pending = pendingTrackLanguages
+        .where((item) => item.fingerprint == fingerprint)
+        .firstOrNull;
+    if (pending == null) return null;
+    try {
+      await _trackLanguagePreferences.save(
+        fingerprint,
+        choice.confirmedByUser(),
+      );
+      if (!_trackLanguageConfirmationState.canApply(revision, mediaKey)) {
+        return null;
+      }
+      _applyConfirmedTrackLanguages(mediaKey, {
+        fingerprint: choice,
+      });
+      pendingTrackLanguages.remove(pending);
+      return null;
+    } on Object {
+      if (!_trackLanguageConfirmationState.canApply(revision, mediaKey)) {
+        return null;
+      }
+      _applyConfirmedTrackLanguages(mediaKey, {
+        fingerprint: choice,
+      });
+      pendingTrackLanguages.remove(pending);
+      return '语言设置未能保存，下次可能需要重新确认';
+    }
+  }
+
+  Future<void> _selectDefaultEmbeddedTracks() async {
+    final shouldSelectAudio = _embeddedTrackSelection.beginAutomaticSelection(
+      hasAudioTracks: availableAudioTracks.isNotEmpty,
+    );
+    final automaticSubtitleSelection =
+        _subtitleTrackSelection.beginAutomaticSelection();
+    final current = mediaPlayer?.state.track;
+    final audio = selectPreferredAudioTrack(
+      availableAudioTracks,
+      defaultTrackId: current?.audio.id,
+    );
+    final subtitle = selectPreferredSubtitleTrack(
+          availableEmbeddedSubtitleTracks,
+          defaultTrackId: current?.subtitle.id,
+        ) ??
+        availableEmbeddedSubtitleTracks.firstOrNull;
+    if (shouldSelectAudio &&
+        audio != null &&
+        _embeddedTrackSelection.canAutomaticallySelectAudio) {
+      await selectAudioTrack(audio.id, manual: false);
+    }
+    if (!_subtitleTrackSelection.canApplyAutomaticSelection(
+      automaticSubtitleSelection,
+    )) {
+      return;
+    }
+    if (subtitle != null && currentSubtitlePath.isEmpty) {
+      await selectEmbeddedSubtitleTrack(subtitle.id, manual: false);
+    } else if (subtitle == null && currentSubtitlePath.isEmpty) {
+      await _disableSubtitleTrack();
+    }
+    AppLogger().i(
+      'PlayerController: automatic track selection audio=${audio?.id ?? "none"}, '
+      'subtitle=${subtitle?.id ?? "off"}',
+    );
+  }
+
+  Future<void> _setFlutterSubtitleMode(NativePlayer player) async {
+    final useNativeSubtitleRendering = player.configuration.libass;
+    await _trySetNativeSubtitleProperty(
+      player,
+      'sub-visibility',
+      useNativeSubtitleRendering ? 'yes' : 'no',
+    );
+    await _trySetNativeSubtitleProperty(
+      player,
+      'secondary-sub-visibility',
+      'no',
+    );
+    await _trySetNativeSubtitleProperty(player, 'secondary-sid', 'no');
+  }
+
+  Future<void> _trySetNativeSubtitleProperty(
+    NativePlayer player,
+    String property,
+    String value,
+  ) async {
+    try {
+      await player.setProperty(property, value);
+    } catch (e) {
+      AppLogger()
+          .w('PlayerController: failed to set $property=$value', error: e);
+    }
+  }
+
+  @action
+  Future<void> refreshSubtitleCandidates() async {
+    if (!isLocalPlayback || videoUrl.isEmpty) {
+      subtitleCandidates.clear();
+      return;
+    }
+    final candidates = await _localSubtitleMatcher.findAllForVideo(videoUrl);
+    subtitleCandidates
+      ..clear()
+      ..addAll(candidates);
+  }
+
+  @action
+  Future<bool> selectSubtitle(String subtitlePath) async {
+    final loaded = await loadExternalSubtitle(subtitlePath);
+    if (loaded && isLocalPlayback) {
+      await refreshSubtitleCandidates();
+    }
+    return loaded;
+  }
+
+  @action
+  Future<LocalSubtitleImportResult?> importSubtitle(
+    String subtitlePath, {
+    LocalSubtitleImportTarget target =
+        LocalSubtitleImportTarget.subtitleDirectory,
+  }) async {
+    if (!isLocalPlayback || videoUrl.isEmpty) return null;
+    final result = await _localSubtitleImporter.importForVideo(
+      videoPath: videoUrl,
+      subtitlePath: subtitlePath,
+      target: target,
+    );
+    await refreshSubtitleCandidates();
+    await loadExternalSubtitle(result.targetPath);
+    return result;
+  }
+
+  @action
+  Future<void> clearSubtitle() async {
+    _subtitleTrackSelection.markManualSelection();
+    try {
+      await _disableSubtitleTrack(clearCurrentPath: true);
+      AppLogger().i('PlayerController: subtitle disabled');
+    } catch (e) {
+      AppLogger().w('PlayerController: failed to disable subtitle', error: e);
+    }
+  }
+
+  @action
+  Future<bool> restoreLastSubtitle() async {
+    final subtitlePath = lastSubtitlePath.trim();
+    if (subtitlePath.isEmpty) return false;
+    return selectSubtitle(subtitlePath);
+  }
+
+  void _setCurrentSubtitlePath(String value) {
+    currentSubtitlePath = value;
+    if (value.isNotEmpty) {
+      lastSubtitlePath = value;
+    }
+  }
+
+  @action
+  Future<void> applySubtitleStyle({
+    double? fontSize,
+    int? colorValue,
+    int? borderColorValue,
+    double? borderSize,
+    bool? shadowEnabled,
+    double? shadowOffset,
+    double? position,
+    bool? forceStyle,
+    bool save = true,
+  }) async {
+    subtitleFontSize =
+        (fontSize ?? subtitleFontSize).clamp(18.0, 72.0).toDouble();
+    subtitleColorValue = colorValue ?? subtitleColorValue;
+    subtitleBorderColorValue = borderColorValue ?? subtitleBorderColorValue;
+    subtitleBorderSize =
+        (borderSize ?? subtitleBorderSize).clamp(0.0, 8.0).toDouble();
+    subtitleShadowEnabled = shadowEnabled ?? subtitleShadowEnabled;
+    subtitleShadowOffset =
+        (shadowOffset ?? subtitleShadowOffset).clamp(0.0, 8.0).toDouble();
+    subtitlePosition =
+        (position ?? subtitlePosition).clamp(60.0, 100.0).toDouble();
+    subtitleForceStyle = forceStyle ?? subtitleForceStyle;
+
+    if (save) {
+      await _subtitlePreferences.saveStyle(subtitleStyleSettings);
+    }
+    await _syncSubtitleStyleToPlayer();
+  }
+
+  @action
+  Future<void> resetSubtitleStyle() {
+    return applySubtitleStyle(
+      fontSize: SubtitleStyleSettings.defaultFontSize,
+      colorValue: SubtitleStyleSettings.defaultColorValue,
+      borderColorValue: SubtitleStyleSettings.defaultBorderColorValue,
+      borderSize: SubtitleStyleSettings.defaultBorderSize,
+      shadowEnabled: SubtitleStyleSettings.defaultShadowEnabled,
+      shadowOffset: SubtitleStyleSettings.defaultShadowOffset,
+      position: SubtitleStyleSettings.defaultPosition,
+      forceStyle: SubtitleStyleSettings.defaultForceStyle,
+    );
+  }
+
+  @action
+  Future<void> setSubtitleDelay(double seconds) async {
+    final stepped = (seconds * 2).round() / 2;
+    subtitleDelaySeconds = stepped.clamp(-30.0, 30.0).toDouble();
+    await _syncSubtitleDelayToPlayer();
+    await _saveSubtitleDelayForCurrentVideo();
+  }
+
+  @action
+  Future<void> resetSubtitleDelay() => setSubtitleDelay(0.0);
+
+  void _loadSubtitleDelayForCurrentVideo() {
+    subtitleDelaySeconds = 0.0;
+    if (!isLocalPlayback && _subtitleStorageKey == null) return;
+    if (_subtitleDelayStorageKey.isEmpty) return;
+    try {
+      subtitleDelaySeconds = _subtitlePreferences.loadDelay(
+        _subtitleDelayStorageKey,
+      );
+    } catch (e) {
+      AppLogger()
+          .w('PlayerController: failed to load subtitle delay', error: e);
+    }
+  }
+
+  Future<void> _saveSubtitleDelayForCurrentVideo() async {
+    if (!isLocalPlayback && _subtitleStorageKey == null) return;
+    if (_subtitleDelayStorageKey.isEmpty) return;
+    try {
+      await _subtitlePreferences.saveDelay(
+        _subtitleDelayStorageKey,
+        subtitleDelaySeconds,
+      );
+    } catch (e) {
+      AppLogger()
+          .w('PlayerController: failed to save subtitle delay', error: e);
+    }
+  }
+
+  String get _subtitleDelayStorageKey =>
+      _subtitleStorageKey ?? videoUrl.trim().toLowerCase();
+
+  Future<bool> _refreshExpiredCloudLink(
+    String error,
+    PlayerMediaToken mediaToken,
+    PlayerLifecycleToken lifecycleToken,
+    PlaybackInitParams params,
+  ) async {
+    final refresh = params.refreshCloudPlayback;
+    if (!_isMediaOperationActive(mediaToken, lifecycleToken) ||
+        refresh == null ||
+        !_mediaOperations.tryBeginRefresh(mediaToken, error)) {
+      return false;
+    }
+    final position = currentPosition;
+    final wasPlaying = playing;
+    final transaction = CloudPlaybackRefreshTransaction(
+      previous: params,
+      position: position,
+      wasPlaying: wasPlaying,
+    );
+    try {
+      final freshParams = await refresh();
+      if (!_isMediaOperationActive(mediaToken, lifecycleToken)) {
+        await _playbackLeaseCoordinator.reject(freshParams.lease);
+        return true;
+      }
+      final refreshed = transaction.merge(freshParams);
+      final refreshedToken = _mediaOperations.beginMedia(
+        refreshed.stableMediaKey,
+        preserveRefreshState: true,
+      );
+      await _playerInitLock.synchronized(
+        () => _init(refreshed, refreshedToken, lifecycleToken),
+      );
+      if (transaction.shouldPauseAfterRefresh &&
+          _isMediaOperationActive(refreshedToken, lifecycleToken)) {
+        await pause();
+      }
+      return true;
+    } on Object catch (refreshError, stackTrace) {
+      if (!_isMediaOperationActive(mediaToken, lifecycleToken)) return true;
+      loading = false;
+      isBuffering = false;
+      AppLogger().e(
+        'PlayerController: cloud playback link refresh failed',
+        error: refreshError,
+        stackTrace: stackTrace,
+      );
+      AppDialog.showToast(
+        message: cloudPlaybackFailureMessage(params.cloudProviderName),
+      );
+      return true;
+    } finally {
+      _mediaOperations.finishRefresh(mediaToken);
+    }
+  }
+
+  Future<void> _syncSubtitleDelayToPlayer() async {
+    final pp = mediaPlayer?.platform;
+    if (pp is! NativePlayer) return;
+    try {
+      await pp.setProperty(
+          'sub-delay', subtitleDelaySeconds.toStringAsFixed(1));
+    } catch (e) {
+      AppLogger()
+          .w('PlayerController: failed to sync subtitle delay', error: e);
+    }
+  }
+
+  void _applyStoredSubtitleStyle() {
+    final style = _subtitlePreferences.loadStyle();
+    subtitleFontSize = style.fontSize;
+    subtitleColorValue = style.colorValue;
+    subtitleBorderColorValue = style.borderColorValue;
+    subtitleBorderSize = style.borderSize;
+    subtitleShadowEnabled = style.shadowEnabled;
+    subtitleShadowOffset = style.shadowOffset;
+    subtitlePosition = style.position;
+    subtitleForceStyle = style.forceStyle;
+  }
+
+  Future<void> _syncSubtitleStyleToPlayer() async {
+    final pp = mediaPlayer?.platform;
+    if (pp is! NativePlayer) return;
+    try {
+      await pp.setProperty(
+          'sub-font-size', subtitleFontSize.toStringAsFixed(0));
+      await pp.setProperty('sub-color', _mpvColor(Color(subtitleColorValue)));
+      await pp.setProperty(
+        'sub-border-color',
+        _mpvColor(Color(subtitleBorderColorValue)),
+      );
+      await pp.setProperty(
+        'sub-border-size',
+        subtitleBorderSize.toStringAsFixed(1),
+      );
+      await pp.setProperty(
+        'sub-shadow-offset',
+        subtitleShadowEnabled ? subtitleShadowOffset.toStringAsFixed(1) : '0',
+      );
+      await pp.setProperty('sub-pos', subtitlePosition.toStringAsFixed(0));
+      await pp.setProperty(
+        'sub-ass-override',
+        subtitleForceStyle ? 'force' : 'no',
+      );
+      if (currentSubtitlePath.isNotEmpty) {
+        await _setFlutterSubtitleMode(pp);
+      }
+    } catch (e) {
+      AppLogger()
+          .w('PlayerController: failed to sync subtitle style', error: e);
+    }
+  }
+
+  String _mpvColor(Color color) {
+    return '#${color.toARGB32().toRadixString(16).padLeft(8, '0')}';
+  }
+
+  void updateAnime4kOutputSize({
+    required Size logicalSize,
+    required double devicePixelRatio,
+  }) {
+    final pixels = Size(
+      logicalSize.width * devicePixelRatio,
+      logicalSize.height * devicePixelRatio,
+    );
+    if (pixels == _anime4kOutputPixels) return;
+    _anime4kOutputPixels = pixels;
+    _scheduleAnime4kEvaluation();
+  }
+
+  void _scheduleAnime4kEvaluation() {
+    _anime4kLayoutDebounce?.cancel();
+    _anime4kLayoutDebounce = Timer(
+      const Duration(milliseconds: 250),
+      () => unawaited(_evaluateAnime4k()),
+    );
+  }
+
+  @action
+  Future<void> setAnime4kPreference(Anime4kPreference value) async {
+    _anime4kLayoutDebounce?.cancel();
+    _anime4kCoordinator.resetFailureLock();
+    anime4kPreference = value;
+    await _evaluateAnime4k();
+  }
+
+  @action
+  void setAspectRatioType(int value) {
+    if (aspectRatioType == value) return;
+    aspectRatioType = value;
+    _scheduleAnime4kEvaluation();
+  }
+
+  Future<void> _evaluateAnime4k() async {
+    final decision = await _anime4kCoordinator.evaluateAndApply(
+      Anime4kPolicyInput(
+        preference: anime4kPreference,
+        sourceWidth: playerWidth.toDouble(),
+        sourceHeight: playerHeight.toDouble(),
+        outputWidth: _anime4kOutputPixels.width,
+        outputHeight: _anime4kOutputPixels.height,
+        fit: switch (aspectRatioType) {
+          2 => Anime4kFit.cover,
+          3 => Anime4kFit.fill,
+          _ => Anime4kFit.contain,
+        },
+        shaderSupported:
+            anime4kShadersAvailable && mediaPlayer?.platform is NativePlayer,
+      ),
+    );
+    runInAction(() => anime4kRuntimeState = decision.state);
+  }
+
+  Future<void> _executeAnime4kDecision(Anime4kDecision decision) async {
+    final platform = mediaPlayer?.platform;
+    if (platform is! NativePlayer) return;
+    final stopwatch = Stopwatch()..start();
+    var shaderCount = 0;
+    await platform.waitForPlayerInitialization;
+    await platform.waitForVideoControllerInitializationIfAttached;
+    final executor = Anime4kShaderExecutor(command: platform.command);
+    try {
+      if (decision.action == Anime4kAction.clear) {
+        await executor.apply(Anime4kAction.clear);
+        return;
+      }
+      runInAction(() => anime4kRuntimeState = Anime4kRuntimeState.loading);
+      final shadersDirectory = shadersController.shadersDirectory;
+      final shaderPaths = resolveAnime4kShaderPaths(
+        directoryPath: shadersDirectory?.path,
+        action: decision.action,
+      );
+      if (shaderPaths == null) {
+        throw StateError('Anime4K 着色器目录不可用');
+      }
+      shaderCount = shaderPaths.length;
+      await executor.apply(
+        decision.action,
+        shaderPaths: shaderPaths,
+      );
+    } on Object catch (error, stackTrace) {
+      AppLogger().w(
+        'Anime4K: disabled after load failure '
+        'preference=${anime4kPreference.name} '
+        'source=${playerWidth}x$playerHeight '
+        'output=${_anime4kOutputPixels.width.round()}x${_anime4kOutputPixels.height.round()} '
+        'shaders=$shaderCount elapsedMs=${stopwatch.elapsedMilliseconds}',
+        error: error,
+        stackTrace: stackTrace,
+      );
+      rethrow;
+    } finally {
+      stopwatch.stop();
+      AppLogger().i(
+        'Anime4K: apply finished '
+        'preference=${anime4kPreference.name} '
+        'action=${decision.action.name} '
+        'source=${playerWidth}x$playerHeight '
+        'output=${_anime4kOutputPixels.width.round()}x${_anime4kOutputPixels.height.round()} '
+        'shaders=$shaderCount elapsedMs=${stopwatch.elapsedMilliseconds}',
+      );
+    }
+  }
+
+  Future<void> setPlaybackSpeed(double playerSpeed) async {
+    this.playerSpeed = playerSpeed;
+    final player = mediaPlayer;
+    if (_disposeRequested || player == null) return;
+    try {
+      await player.setRate(playerSpeed);
+    } catch (e) {
+      AppLogger().e('PlayerController: failed to set playback speed', error: e);
+    }
+  }
+
+  Future<void> setVolume(double value) async {
+    value = value.clamp(0.0, 100.0);
+    volume = value;
+    try {
+      final player = mediaPlayer;
+      if (_disposeRequested || player == null) return;
+      await player.setVolume(value);
+    } catch (_) {}
+  }
+
+  Future<void> playOrPause() async {
+    final player = mediaPlayer;
+    if (_disposeRequested || player == null) return;
+    if (player.state.playing) {
+      await pause();
+    } else {
+      await play();
+    }
+  }
+
+  Future<void> seek(Duration duration, {bool enableSync = true}) async {
+    final player = mediaPlayer;
+    if (_disposeRequested || player == null) return;
+    currentPosition = duration;
+    await player.seek(duration);
+  }
+
+  Future<void> pause({bool enableSync = true}) async {
+    final player = mediaPlayer;
+    if (_disposeRequested || player == null) return;
+    await player.pause();
+    playing = false;
+  }
+
+  Future<void> play({bool enableSync = true}) async {
+    final player = mediaPlayer;
+    if (_disposeRequested || player == null) return;
+    await player.play();
+    playing = true;
+  }
+
+  bool _isMediaOperationActive(
+    PlayerMediaToken token,
+    PlayerLifecycleToken lifecycleToken,
+  ) =>
+      !_disposeRequested &&
+      _mediaOperations.isCurrent(token) &&
+      _lifecycleOperations.isCurrent(lifecycleToken);
+
+  Future<void> dispose() {
+    final current = _disposeFuture;
+    if (current != null) return current;
+    _disposeRequested = true;
+    _lifecycleOperations.invalidate();
+    _mediaOperations.invalidate();
+    AppLogger().i('PlayerController: resource disposal started');
+    final future = _playerInitLock.synchronized(() async {
+      await _disposePlayerResources();
+      final clearLocalPlaybackCache = _clearLocalPlaybackCache;
+      if (clearLocalPlaybackCache != null) {
+        try {
+          await clearLocalPlaybackCache();
+        } on Object catch (error, stackTrace) {
+          AppLogger().w(
+            'PlayerController: failed to clear local playback cache',
+            error: error,
+            stackTrace: stackTrace,
+          );
+        }
+      }
+      await _playbackLeaseCoordinator.close();
+      _lastInitParams = null;
+      AppLogger().i('PlayerController: resource disposal completed');
+    });
+    _disposeFuture = future;
+    return future;
+  }
+
+  Future<void> _disposePlayerResources() async {
+    _anime4kLayoutDebounce?.cancel();
+    _anime4kLayoutDebounce = null;
+    _anime4kOutputPixels = Size.zero;
+    _anime4kCoordinator.reset();
+    runInAction(() => anime4kRuntimeState = Anime4kRuntimeState.off);
+
+    final steps = <({String name, PlayerDisposeStep dispose})>[
+      if (playerErrorSubscription case final subscription?)
+        (name: 'error-subscription', dispose: subscription.cancel),
+      if (playerLogSubscription case final subscription?)
+        (name: 'log-subscription', dispose: subscription.cancel),
+      if (playerWidthSubscription case final subscription?)
+        (name: 'width-subscription', dispose: subscription.cancel),
+      if (playerHeightSubscription case final subscription?)
+        (name: 'height-subscription', dispose: subscription.cancel),
+      if (playerVideoParamsSubscription case final subscription?)
+        (name: 'video-params-subscription', dispose: subscription.cancel),
+      if (playerAudioParamsSubscription case final subscription?)
+        (name: 'audio-params-subscription', dispose: subscription.cancel),
+      if (playerPlaylistSubscription case final subscription?)
+        (name: 'playlist-subscription', dispose: subscription.cancel),
+      if (playerTracksSubscription case final subscription?)
+        (name: 'tracks-subscription', dispose: subscription.cancel),
+      if (playerAvailableTracksSubscription case final subscription?)
+        (name: 'available-tracks-subscription', dispose: subscription.cancel),
+      if (playerAudioBitrateSubscription case final subscription?)
+        (name: 'audio-bitrate-subscription', dispose: subscription.cancel),
+      if (mediaPlayer case final player?)
+        (name: 'player', dispose: player.dispose),
+    ];
+
+    playerErrorSubscription = null;
+    playerLogSubscription = null;
+    playerWidthSubscription = null;
+    playerHeightSubscription = null;
+    playerVideoParamsSubscription = null;
+    playerAudioParamsSubscription = null;
+    playerPlaylistSubscription = null;
+    playerTracksSubscription = null;
+    playerAvailableTracksSubscription = null;
+    playerAudioBitrateSubscription = null;
+    mediaPlayer = null;
+    videoController = null;
+
+    final failures = await _resourceDisposer.dispose(
+      steps.map((step) => step.dispose),
+    );
+    for (final failure in failures) {
+      AppLogger().w(
+        'PlayerController: resource disposal failed '
+        'step=${steps[failure.stepIndex].name}',
+        error: failure.error,
+        stackTrace: failure.stackTrace,
+      );
+    }
+  }
+
+  Future<void> stop() async {
+    try {
+      await mediaPlayer?.stop();
+      loading = true;
+    } catch (_) {}
+  }
+
+  Future<Uint8List?> screenshot({String format = 'image/jpeg'}) async {
+    final player = mediaPlayer;
+    if (_disposeRequested || player == null) return null;
+    return await player.screenshot(format: format);
+  }
+
+  void setButtonForwardTime(int time) {
+    buttonSkipTime = time;
+    unawaited(_runtimePreferences.saveButtonSkipTime(time));
+  }
+
+  void setArrowKeyForwardTime(int time) {
+    arrowKeySkipTime = time;
+    unawaited(_runtimePreferences.saveArrowKeySkipTime(time));
+  }
+
+  void lanunchExternalPlayer() async {
+    if (referer.isNotEmpty) {
+      AppDialog.showToast(message: '带鉴权请求头的视频暂不支持外部播放器');
+      return;
+    }
+    if (await ExternalPlayer.launchURLWithMIME(videoUrl, 'video/mp4')) {
+      AppDialog.dismiss<void>();
+      AppDialog.showToast(message: '尝试唤起外部播放器');
+    } else {
+      AppDialog.showToast(message: '唤起外部播放器失败');
+    }
+  }
+}

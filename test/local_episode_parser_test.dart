@@ -1,0 +1,192 @@
+import 'package:flutter_test/flutter_test.dart';
+import 'package:kanyingyin/services/local_episode_parser.dart';
+
+void main() {
+  final parser = LocalEpisodeParser();
+
+  test('LocalEpisodeParser parses SxxExx names', () {
+    final info = parser.parse('Frieren S01E12 The Real Hero.mkv');
+
+    expect(info, isNotNull);
+    expect(info!.seriesName, 'Frieren');
+    expect(info.seasonNumber, 1);
+    expect(info.episodeNumber, 12);
+    expect(info.episodeTitle, 'The Real Hero');
+    expect(info.episodeLabel, 'S01E12');
+  });
+
+  test('LocalEpisodeParser parses Chinese episode names', () {
+    final info = parser.parse(
+      '\u846c\u9001\u7684\u8299\u8389\u83b2 '
+      '\u7b2c08\u96c6 '
+      '\u5317\u65b9\u8bf8\u56fd.mkv',
+    );
+
+    expect(info, isNotNull);
+    expect(info!.seriesName, '\u846c\u9001\u7684\u8299\u8389\u83b2');
+    expect(info.episodeNumber, 8);
+    expect(info.displayTitle, '\u7b2c 08 \u96c6  \u5317\u65b9\u8bf8\u56fd');
+  });
+
+  test('LocalEpisodeParser parses bracketed episode names', () {
+    final info = parser.parse('[Fansub] Bang Dream [03].mp4');
+
+    expect(info, isNotNull);
+    expect(info!.seriesName, 'Bang Dream');
+    expect(info.episodeNumber, 3);
+    expect(info.releaseGroup, 'Fansub');
+  });
+
+  test('LocalEpisodeParser uses bracketed episode after release tags', () {
+    final info = parser.parse(
+      r'D:\a TV\[SumiSora][Chu-2_Koi][BDRip]\[SumiSora][Chu-2_Koi][BDRip][01][x264_3flac](62A8611D).mkv',
+    );
+
+    expect(info, isNotNull);
+    expect(info!.seriesName, 'Chu 2 Koi');
+    expect(info.episodeNumber, 1);
+    expect(info.releaseGroup, 'SumiSora');
+  });
+
+  test('LocalEpisodeParser 清除带短横线的发布组前缀', () {
+    final info = parser.parse(
+      '[VCB-Studio] Isekai Nonbiri Nouka '
+      '[01][Ma10p_1080p][x265_flac].mkv',
+    );
+
+    expect(info, isNotNull);
+    expect(info!.seriesName, 'Isekai Nonbiri Nouka');
+    expect(info.episodeNumber, 1);
+  });
+
+  test('LocalEpisodeParser uses season directory for bare episode files', () {
+    final info = parser.parse(r'D:\Anime\Frieren\Season 2\Frieren - 03.mkv');
+
+    expect(info, isNotNull);
+    expect(info!.seriesName, 'Frieren');
+    expect(info.seasonNumber, 2);
+    expect(info.episodeNumber, 3);
+  });
+
+  test('LocalEpisodeParser parses Chinese season and episode names', () {
+    final info = parser.parse(
+      '\u846c\u9001\u7684\u8299\u8389\u83b2 '
+      '\u7b2c2\u5b63 \u7b2c04\u8bdd 旅路.mkv',
+    );
+
+    expect(info, isNotNull);
+    expect(info!.seriesName, '\u846c\u9001\u7684\u8299\u8389\u83b2');
+    expect(info.seasonNumber, 2);
+    expect(info.episodeNumber, 4);
+  });
+
+  test('LocalEpisodeParser falls back to parent folder for fansub prefix', () {
+    final info = parser.parse(r'D:\Anime\My Show\[Nekomoe] [05][1080p].mkv');
+
+    expect(info, isNotNull);
+    expect(info!.seriesName, 'My Show');
+    expect(info.episodeNumber, 5);
+  });
+
+  test('LocalEpisodeParser ignores names without episode number', () {
+    final info = parser.parse('Movie Special.mkv');
+
+    expect(info, isNull);
+  });
+
+  test('LocalEpisodeParser ignores movie years in titles', () {
+    final info = parser.parse('Persian Lessons 2020.mkv');
+
+    expect(info, isNull);
+  });
+
+  test('LocalEpisodeParser does not truncate four digit years as episodes', () {
+    final info = parser.parse('Movie Title - 2024.mkv');
+
+    expect(info, isNull);
+  });
+
+  test('LocalEpisodeParser ignores movie release trailing numbers', () {
+    final info = parser.parse(
+      '因果报应 Maharaja 2024 HQ WEB DL DT 01.mkv',
+    );
+
+    expect(info, isNull);
+  });
+
+  test('LocalEpisodeParser 不把 3Audio 音轨标记识别为电影集号', () {
+    final info = parser.parse(
+      'Annihilation.2018.BluRay.2160p.x265.10bit.HDR.3Audio.-SSDSSE.mkv',
+    );
+
+    expect(info, isNull);
+  });
+
+  test('LocalEpisodeParser 不把电影标题中的周年数字识别为集号', () {
+    final info = parser.parse(
+      r'D:\电影\假面骑士OOO 10周年 复活的核心硬币\假面骑士OOO 10周年 复活的核心硬币.mkv',
+    );
+
+    expect(info, isNull);
+  });
+
+  test('LocalEpisodeParser ignores 4K release markers as episodes', () {
+    final info = parser.parse('interstellar 2014 imax 4K-kc.mkv');
+
+    expect(info, isNull);
+  });
+
+  test('LocalEpisodeParser 跳过 4K 标记并识别后续真实集号', () {
+    final first = parser.parse(
+      '【熊猫】最强阴阳师的异世界转生记 BD 4K 1 [4K BD].mkv',
+    );
+    final ninth = parser.parse(
+      '【熊猫】最强阴阳师的异世界转生记 BD 4K 9 [4K BD].mkv',
+    );
+
+    expect(first, isNotNull);
+    expect(first!.seriesName, '最强阴阳师的异世界转生记');
+    expect(first.episodeNumber, 1);
+    expect(ninth, isNotNull);
+    expect(ninth!.seriesName, '最强阴阳师的异世界转生记');
+    expect(ninth.episodeNumber, 9);
+  });
+
+  test('LocalEpisodeParser 识别标题季度数字后的短横线集号', () {
+    final info = parser.parse(
+      '[LoliHouse] Isekai Nonbiri Nouka 2 - 07 '
+      '[WebRip 1080p HEVC-10bit AAC SRTx2].mkv',
+    );
+
+    expect(info, isNotNull);
+    expect(info!.seriesName, 'Isekai Nonbiri Nouka 2');
+    expect(info.episodeNumber, 7);
+  });
+
+  test('LocalEpisodeParser 复用共享动态范围和音轨清理', () {
+    final info = parser.parse(
+      'Alice in Borderland S03E01 '
+      '2160p WEB-DL H265 DV HDR DDP 5.1 Atmos.mkv',
+    );
+
+    expect(info, isNotNull);
+    expect(info!.seriesName, 'Alice in Borderland');
+    expect(info.seasonNumber, 3);
+    expect(info.episodeNumber, 1);
+    expect(info.episodeTitle, isNull);
+    expect(info.resolution, '2160p');
+    expect(info.source, 'Web-DL');
+    expect(info.codec, 'H265');
+  });
+
+  test('LocalEpisodeParser 继续保护年份画质和数字电影名', () {
+    for (final name in <String>[
+      '流浪地球2 2023 4K.mkv',
+      'interstellar 2014 imax 4K-kc.mkv',
+      'The 100.mkv',
+      '1923.mkv',
+    ]) {
+      expect(parser.parse(name), isNull, reason: name);
+    }
+  });
+}

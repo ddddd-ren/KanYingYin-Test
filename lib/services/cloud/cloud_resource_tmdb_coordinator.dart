@@ -1,0 +1,553 @@
+import 'dart:async';
+import 'dart:collection';
+
+import 'package:flutter/foundation.dart';
+import 'package:kanyingyin/modules/cloud/cloud_file_entry.dart';
+import 'package:kanyingyin/modules/cloud/cloud_media_index_item.dart';
+import 'package:kanyingyin/modules/cloud/cloud_resource_tmdb_record.dart';
+import 'package:kanyingyin/modules/cloud/cloud_source.dart';
+import 'package:kanyingyin/modules/local/tmdb_metadata.dart';
+import 'package:kanyingyin/repositories/cloud_resource_tmdb_repository.dart';
+import 'package:kanyingyin/services/cloud/cloud_remote_ref.dart';
+import 'package:kanyingyin/services/cloud/cloud_resource_tmdb_search.dart';
+import 'package:kanyingyin/services/cloud/cloud_resource_tmdb_service.dart';
+import 'package:kanyingyin/services/cloud/cloud_series_match_service.dart';
+import 'package:kanyingyin/services/local_video_file_types.dart';
+import 'package:kanyingyin/services/tmdb/tmdb_matcher.dart';
+import 'package:kanyingyin/services/tmdb/tmdb_scrape_options.dart';
+import 'package:kanyingyin/services/tmdb/tmdb_scrape_subject.dart';
+
+typedef CloudResourceTmdbServiceFactory = FutureOr<CloudResourceTmdbService>
+    Function(String apiKey);
+
+class CloudResourceDirectoryContext {
+  const CloudResourceDirectoryContext({
+    required this.source,
+    required this.directory,
+    required this.entries,
+    required this.isConfiguredRoot,
+    this.indexedItemsByKey = const <String, CloudMediaIndexItem>{},
+  });
+
+  final CloudSource source;
+  final CloudRemoteRef directory;
+  final List<CloudFileEntry> entries;
+  final bool isConfiguredRoot;
+  final Map<String, CloudMediaIndexItem> indexedItemsByKey;
+}
+
+class CloudResourceTmdbCoordinator extends ChangeNotifier {
+  CloudResourceTmdbCoordinator({
+    required CloudResourceTmdbRepository repository,
+    required CloudResourceTmdbServiceFactory serviceFactory,
+    required String Function() apiKeyProvider,
+    CloudSeriesMatchService? seriesMatchService,
+    TmdbScrapeOptions Function()? optionsProvider,
+    DateTime Function()? now,
+  })  : _repository = repository,
+        _serviceFactory = serviceFactory,
+        _apiKeyProvider = apiKeyProvider,
+        _seriesMatchService = seriesMatchService,
+        _optionsProvider =
+            optionsProvider ?? (() => const TmdbScrapeOptions.defaults()),
+        _now = now ?? DateTime.now;
+
+  static const Duration unmatchedRetryInterval = Duration(days: 7);
+  static const int maximumConcurrentScrapes = 2;
+
+  final CloudResourceTmdbRepository _repository;
+  final CloudResourceTmdbServiceFactory _serviceFactory;
+  final String Function() _apiKeyProvider;
+  final CloudSeriesMatchService? _seriesMatchService;
+  final TmdbScrapeOptions Function() _optionsProvider;
+  final DateTime Function() _now;
+  final Map<String, CloudResourceTmdbRecord> _records =
+      <String, CloudResourceTmdbRecord>{};
+  final Set<String> _scrapingKeys = <String>{};
+  final Map<String, CloudResourceTmdbTarget> _pendingIndexSyncTargets =
+      <String, CloudResourceTmdbTarget>{};
+
+  int _generation = 0;
+  int _completedCount = 0;
+  int _totalCount = 0;
+  int _recordsRevision = 0;
+  String? _serviceApiKey;
+  Future<CloudResourceTmdbService>? _service;
+
+  Map<String, CloudResourceTmdbRecord> get records =>
+      UnmodifiableMapView<String, CloudResourceTmdbRecord>(_records);
+
+  int get recordsRevision => _recordsRevision;
+
+  Set<String> get scrapingKeys => UnmodifiableSetView<String>(_scrapingKeys);
+
+  int get completedCount => _completedCount;
+  int get totalCount => _totalCount;
+  bool get isScraping => _scrapingKeys.isNotEmpty;
+  bool get hasApiKey => _apiKeyProvider().trim().isNotEmpty;
+  TmdbScrapeOptions get options => _optionsProvider();
+
+  Future<void> loadAndSchedule(CloudResourceDirectoryContext context) async {
+    final generation = ++_generation;
+    final stored = await _repository.getBySource(context.source.id);
+    if (generation != _generation) return;
+    _records
+      ..clear()
+      ..addEntries(stored.map((record) => MapEntry(record.stableKey, record)));
+    _markRecordsChanged();
+    _scrapingKeys.clear();
+    _completedCount = 0;
+    _totalCount = 0;
+    notifyListeners();
+
+    await _retryPendingIndexSyncWithSeries(context);
+    await _applySeriesRules(context);
+
+    final apiKey = _apiKeyProvider().trim();
+    if (apiKey.isEmpty) return;
+    final service = await _serviceFor(apiKey);
+    if (_seriesMatchService == null) {
+      await _retryPendingIndexSync(context, service);
+    }
+    final targets = _targetsToSchedule(context, _now());
+    _totalCount = targets.length;
+    if (targets.isEmpty) {
+      notifyListeners();
+      return;
+    }
+    notifyListeners();
+
+    var nextIndex = 0;
+    Future<void> worker() async {
+      while (generation == _generation && nextIndex < targets.length) {
+        final target = targets[nextIndex++];
+        await _autoScrape(target, apiKey, generation);
+      }
+    }
+
+    final workerCount = targets.length < maximumConcurrentScrapes
+        ? targets.length
+        : maximumConcurrentScrapes;
+    await Future.wait(
+      List<Future<void>>.generate(workerCount, (_) => worker()),
+    );
+  }
+
+  Future<CloudResourceTmdbOutcome> scrape(
+    CloudResourceTmdbTarget target, {
+    TmdbScrapeOptions? options,
+  }) async {
+    final ruleApplication = await applySeriesRule(target);
+    if (ruleApplication != null) {
+      return CloudResourceTmdbOutcome(
+        candidates: <TmdbMetadata>[ruleApplication.metadata],
+        selected: ruleApplication.record,
+      );
+    }
+    final apiKey = _requiredApiKey();
+    return _tracked(target, () async {
+      final service = await _serviceFor(apiKey);
+      final outcome = await service.match(
+        target,
+        options: options ?? _optionsProvider(),
+      );
+      await _refreshRecord(target);
+      return outcome;
+    });
+  }
+
+  Future<CloudSeriesRuleApplication?> applySeriesRule(
+    CloudResourceTmdbTarget target,
+  ) async {
+    final seriesMatchService = _seriesMatchService;
+    if (seriesMatchService == null) return null;
+    final application = await seriesMatchService.applyRule(
+      target: target,
+      existingRecord: _records[target.stableKey],
+    );
+    if (application == null) return null;
+    _records[application.record.stableKey] = application.record;
+    _markRecordsChanged();
+    if (application.indexSynced) {
+      _pendingIndexSyncTargets.remove(target.stableKey);
+    } else {
+      _pendingIndexSyncTargets[target.stableKey] = target;
+    }
+    notifyListeners();
+    return application;
+  }
+
+  Future<CloudResourceTmdbOutcome> rematch(
+    CloudResourceTmdbTarget target, {
+    TmdbScrapeOptions? options,
+  }) async {
+    final apiKey = _requiredApiKey();
+    return _tracked(target, () async {
+      final service = await _serviceFor(apiKey);
+      return service.searchCandidates(
+        target,
+        options: options ?? _optionsProvider(),
+      );
+    });
+  }
+
+  Future<CloudResourceTmdbSearchOutcome> searchPrepared(
+    CloudResourceTmdbTarget target,
+    CloudResourceTmdbSearchRequest request,
+  ) async {
+    final apiKey = _requiredApiKey();
+    return _tracked(target, () async {
+      final service = await _serviceFor(apiKey);
+      return service.searchPrepared(target, request);
+    });
+  }
+
+  Future<CloudResourceTmdbSelectionOutcome> selectPrepared(
+    CloudResourceTmdbTarget target,
+    TmdbRankedCandidate candidate, {
+    required TmdbScrapeOptions options,
+    List<CloudResourceTmdbTarget> propagationCandidates =
+        const <CloudResourceTmdbTarget>[],
+  }) async {
+    final apiKey = _requiredApiKey();
+    return _tracked(target, () async {
+      final service = await _serviceFor(apiKey);
+      final outcome = await service.selectWithOutcome(
+        target,
+        candidate.metadata,
+        options: options,
+      );
+      return _rememberSelection(
+        target,
+        outcome,
+        propagationCandidates: propagationCandidates,
+        language: options.language,
+      );
+    });
+  }
+
+  Future<CloudResourceTmdbRecord> select(
+    CloudResourceTmdbTarget target,
+    TmdbMetadata candidate, {
+    TmdbScrapeOptions? options,
+    List<CloudResourceTmdbTarget> propagationCandidates =
+        const <CloudResourceTmdbTarget>[],
+  }) async {
+    final apiKey = _requiredApiKey();
+    return _tracked(target, () async {
+      final service = await _serviceFor(apiKey);
+      final resolvedOptions = options ?? _optionsProvider();
+      final outcome = await service.selectWithOutcome(
+        target,
+        candidate,
+        options: resolvedOptions,
+      );
+      final remembered = await _rememberSelection(
+        target,
+        outcome,
+        propagationCandidates: propagationCandidates,
+        language: resolvedOptions.language,
+      );
+      return remembered.record;
+    });
+  }
+
+  Future<CloudResourceTmdbSelectionOutcome> _rememberSelection(
+    CloudResourceTmdbTarget target,
+    CloudResourceTmdbSelectionOutcome outcome, {
+    required List<CloudResourceTmdbTarget> propagationCandidates,
+    required String language,
+  }) async {
+    _records[outcome.record.stableKey] = outcome.record;
+    _markRecordsChanged();
+    if (outcome.indexSynced) {
+      _pendingIndexSyncTargets.remove(target.stableKey);
+    } else {
+      _pendingIndexSyncTargets[target.stableKey] = target;
+    }
+    final seriesMatchService = _seriesMatchService;
+    if (seriesMatchService == null) return outcome;
+
+    final propagation = await seriesMatchService.learnAndPropagate(
+      anchor: target,
+      anchorRecord: outcome.record,
+      candidates: propagationCandidates,
+      existingRecords: _records,
+      language: language,
+    );
+    for (final record in propagation.records) {
+      _records[record.stableKey] = record;
+      _pendingIndexSyncTargets.remove(record.stableKey);
+    }
+    for (final pendingTarget in propagation.pendingIndexSyncTargets) {
+      _pendingIndexSyncTargets[pendingTarget.stableKey] = pendingTarget;
+    }
+    return CloudResourceTmdbSelectionOutcome(
+      record: outcome.record,
+      posterCached: outcome.posterCached,
+      indexSynced: outcome.indexSynced,
+      seriesPropagation: CloudSeriesPropagationSummary(
+        eligible: propagation.eligible,
+        ruleSaved: propagation.ruleSaved,
+        propagatedCount: propagation.records.length,
+        indexSyncFailures: propagation.indexSyncFailures,
+      ),
+    );
+  }
+
+  Future<void> _retryPendingIndexSync(
+    CloudResourceDirectoryContext context,
+    CloudResourceTmdbService service,
+  ) async {
+    if (_pendingIndexSyncTargets.isEmpty) return;
+    final visibleKeys = context.entries
+        .map(
+          (entry) => cloudResourceTmdbKey(
+            sourceId: context.source.id,
+            remoteId: entry.id,
+            remotePath: entry.remotePath,
+          ),
+        )
+        .toSet();
+    for (final key in visibleKeys) {
+      final target = _pendingIndexSyncTargets[key];
+      final record = _records[key];
+      if (target == null || record == null) continue;
+      if (await service.syncRecordToIndex(target, record)) {
+        _pendingIndexSyncTargets.remove(key);
+      }
+    }
+  }
+
+  Future<void> _retryPendingIndexSyncWithSeries(
+    CloudResourceDirectoryContext context,
+  ) async {
+    final seriesMatchService = _seriesMatchService;
+    if (seriesMatchService == null || _pendingIndexSyncTargets.isEmpty) return;
+    final visibleKeys = context.entries
+        .map(
+          (entry) => cloudResourceTmdbKey(
+            sourceId: context.source.id,
+            remoteId: entry.id,
+            remotePath: entry.remotePath,
+          ),
+        )
+        .toSet();
+    for (final key in visibleKeys) {
+      final target = _pendingIndexSyncTargets[key];
+      final record = _records[key];
+      if (target == null || record == null) continue;
+      if (await seriesMatchService.syncRecordToIndex(
+        target: target,
+        record: record,
+      )) {
+        _pendingIndexSyncTargets.remove(key);
+      }
+    }
+  }
+
+  Future<void> _applySeriesRules(
+    CloudResourceDirectoryContext context,
+  ) async {
+    if (_seriesMatchService == null) return;
+    for (final entry in context.entries) {
+      if (entry.isDirectory || !LocalVideoFileTypes.isVideoPath(entry.name)) {
+        continue;
+      }
+      final key = cloudResourceTmdbKey(
+        sourceId: context.source.id,
+        remoteId: entry.id,
+        remotePath: entry.remotePath,
+      );
+      await applySeriesRule(_targetForEntry(context, entry, _records[key]));
+    }
+  }
+
+  Future<CloudResourceTmdbRecord> saveCustomTitle(
+    CloudResourceTmdbTarget target,
+    String title,
+  ) async {
+    final normalized = title.trim();
+    if (normalized.isEmpty) throw ArgumentError.value(title, 'title');
+    final existing = await _repository.get(target.stableKey);
+    final record = (existing ?? _uncheckedRecord(target)).withCustomTitle(
+      normalized,
+    );
+    await _repository.upsert(record);
+    _records[record.stableKey] = record;
+    _markRecordsChanged();
+    notifyListeners();
+    return record;
+  }
+
+  Future<CloudResourceTmdbRecord> clearCustomTitle(
+    CloudResourceTmdbTarget target,
+  ) async {
+    final existing = await _repository.get(target.stableKey);
+    final record = (existing ?? _uncheckedRecord(target)).clearCustomTitle();
+    await _repository.upsert(record);
+    _records[record.stableKey] = record;
+    _markRecordsChanged();
+    notifyListeners();
+    return record;
+  }
+
+  List<CloudResourceTmdbTarget> _targetsToSchedule(
+    CloudResourceDirectoryContext context,
+    DateTime now,
+  ) {
+    final targets = <CloudResourceTmdbTarget>[];
+    for (final entry in context.entries) {
+      if (!entry.isDirectory &&
+          (!context.isConfiguredRoot ||
+              !LocalVideoFileTypes.isVideoPath(entry.name))) {
+        continue;
+      }
+      final cached = _records[cloudResourceTmdbKey(
+        sourceId: context.source.id,
+        remoteId: entry.id,
+        remotePath: entry.remotePath,
+      )];
+      final target = _targetForEntry(context, entry, cached);
+      if (cached != null && cached.displayName == target.displayName) {
+        if (cached.status == CloudResourceTmdbStatus.conflict) continue;
+        if (cached.status == CloudResourceTmdbStatus.matched &&
+            (cached.tmdbRuleVersion >= currentTmdbRuleVersion ||
+                cached.tmdbMatchOrigin == TmdbMatchOrigin.manual ||
+                cached.customTitle != null)) {
+          continue;
+        }
+        if (cached.status == CloudResourceTmdbStatus.unmatched &&
+            cached.checkedAt.add(unmatchedRetryInterval).isAfter(now)) {
+          continue;
+        }
+      }
+      targets.add(target);
+    }
+    return targets;
+  }
+
+  CloudResourceTmdbTarget _targetForEntry(
+    CloudResourceDirectoryContext context,
+    CloudFileEntry entry,
+    CloudResourceTmdbRecord? cached,
+  ) {
+    final key = cloudResourceTmdbKey(
+      sourceId: context.source.id,
+      remoteId: entry.id,
+      remotePath: entry.remotePath,
+    );
+    final indexed = context.indexedItemsByKey[key];
+    final indexedEpisode = indexed?.mediaType == CloudMediaType.episode;
+    return CloudResourceTmdbTarget(
+      sourceId: context.source.id,
+      remote: CloudRemoteRef(id: entry.id, path: entry.remotePath),
+      displayName: entry.name,
+      resourceKind: entry.isDirectory
+          ? CloudResourceKind.directory
+          : CloudResourceKind.standaloneVideo,
+      customTitle: cached?.customTitle,
+      matchingTitle: indexedEpisode ? indexed?.seriesName : null,
+      matchingSeasonNumber: indexedEpisode ? indexed?.seasonNumber : null,
+      matchingEpisodeNumber: indexedEpisode ? indexed?.episodeNumber : null,
+      size: entry.isDirectory ? null : entry.size,
+    );
+  }
+
+  Future<void> _autoScrape(
+    CloudResourceTmdbTarget target,
+    String apiKey,
+    int generation,
+  ) async {
+    _scrapingKeys.add(target.stableKey);
+    if (generation == _generation) notifyListeners();
+    try {
+      final service = await _serviceFor(apiKey);
+      await service.match(target, options: _optionsProvider());
+      if (generation == _generation) await _refreshRecord(target);
+    } on Object {
+      final failed = CloudResourceTmdbRecord.failed(
+        sourceId: target.sourceId,
+        remoteId: target.remote.id,
+        remotePath: target.remote.path,
+        displayName: target.displayName,
+        resourceKind: target.resourceKind,
+        checkedAt: _now(),
+        customTitle: target.customTitle,
+      );
+      await _repository.upsert(failed);
+      if (generation == _generation) {
+        _records[failed.stableKey] = failed;
+        _markRecordsChanged();
+      }
+    } finally {
+      _scrapingKeys.remove(target.stableKey);
+      if (generation == _generation) {
+        _completedCount++;
+        notifyListeners();
+      }
+    }
+  }
+
+  Future<T> _tracked<T>(
+    CloudResourceTmdbTarget target,
+    Future<T> Function() operation,
+  ) async {
+    _scrapingKeys.add(target.stableKey);
+    notifyListeners();
+    try {
+      return await operation();
+    } finally {
+      _scrapingKeys.remove(target.stableKey);
+      notifyListeners();
+    }
+  }
+
+  Future<void> _refreshRecord(CloudResourceTmdbTarget target) async {
+    final record = await _repository.get(target.stableKey);
+    if (record != null) {
+      _records[record.stableKey] = record;
+      _markRecordsChanged();
+    }
+  }
+
+  void _markRecordsChanged() {
+    _recordsRevision++;
+  }
+
+  CloudResourceTmdbRecord _uncheckedRecord(
+    CloudResourceTmdbTarget target,
+  ) {
+    return CloudResourceTmdbRecord.unchecked(
+      sourceId: target.sourceId,
+      remoteId: target.remote.id,
+      remotePath: target.remote.path,
+      displayName: target.displayName,
+      resourceKind: target.resourceKind,
+      checkedAt: _now(),
+      customTitle: target.customTitle,
+    );
+  }
+
+  String _requiredApiKey() {
+    final apiKey = _apiKeyProvider().trim();
+    if (apiKey.isEmpty) throw StateError('请先在设置中填写 TMDB API Key');
+    return apiKey;
+  }
+
+  Future<CloudResourceTmdbService> _serviceFor(String apiKey) async {
+    if (_service == null || _serviceApiKey != apiKey) {
+      _service = Future<CloudResourceTmdbService>.sync(
+        () => _serviceFactory(apiKey),
+      );
+      _serviceApiKey = apiKey;
+    }
+    final service = _service!;
+    try {
+      return await service;
+    } on Object {
+      if (identical(_service, service)) _service = null;
+      rethrow;
+    }
+  }
+}

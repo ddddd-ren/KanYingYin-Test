@@ -1,0 +1,730 @@
+import 'dart:async';
+import 'dart:collection';
+import 'dart:io';
+import 'dart:math';
+
+import 'package:kanyingyin/platform/app_platform.dart';
+import 'package:kanyingyin/services/cloud/cloud_playback_transport.dart';
+import 'package:kanyingyin/services/cloud/range/cloud_range_chunk_cache.dart';
+import 'package:kanyingyin/services/cloud/range/cloud_range_relay_protocol.dart';
+import 'package:kanyingyin/services/cloud/range/cloud_range_remote_reader.dart';
+import 'package:kanyingyin/utils/logger.dart';
+
+enum CloudRangeRelayAdaptiveMode { base, boosted }
+
+typedef CloudRangeRelayLog = void Function(String message);
+
+class CloudRangeRelayAdaptivePolicy {
+  const CloudRangeRelayAdaptivePolicy({
+    required this.maxConcurrentReads,
+    required this.maxConcurrentPrefetch,
+    required this.prefetchAheadChunks,
+  })  : assert(maxConcurrentReads > 0),
+        assert(maxConcurrentPrefetch > 0),
+        assert(maxConcurrentPrefetch < maxConcurrentReads),
+        assert(prefetchAheadChunks >= maxConcurrentPrefetch);
+
+  final int maxConcurrentReads;
+  final int maxConcurrentPrefetch;
+  final int prefetchAheadChunks;
+}
+
+class CloudRangeRelayTuning {
+  const CloudRangeRelayTuning({
+    required this.chunkSize,
+    required this.maxChunks,
+    required this.maxConcurrentReads,
+    required this.maxConcurrentPrefetch,
+    required this.prefetchAheadChunks,
+    this.prefetchTailOnStart = true,
+    this.adaptivePolicy,
+  })  : assert(chunkSize > 0),
+        assert(maxChunks > 0),
+        assert(maxConcurrentReads > 0),
+        assert(maxConcurrentPrefetch > 0),
+        assert(maxConcurrentPrefetch < maxConcurrentReads),
+        assert(prefetchAheadChunks >= maxConcurrentPrefetch);
+
+  static const windows = CloudRangeRelayTuning(
+    chunkSize: 4 * 1024 * 1024,
+    maxChunks: 64,
+    maxConcurrentReads: 5,
+    maxConcurrentPrefetch: 4,
+    prefetchAheadChunks: 8,
+  );
+
+  static const android = CloudRangeRelayTuning(
+    chunkSize: 4 * 1024 * 1024,
+    maxChunks: 32,
+    maxConcurrentReads: 4,
+    maxConcurrentPrefetch: 3,
+    prefetchAheadChunks: 6,
+  );
+
+  static const androidTv = CloudRangeRelayTuning(
+    chunkSize: 2 * 1024 * 1024,
+    maxChunks: 16,
+    maxConcurrentReads: 3,
+    maxConcurrentPrefetch: 1,
+    prefetchAheadChunks: 2,
+    prefetchTailOnStart: false,
+  );
+
+  static const androidHighThroughput = CloudRangeRelayTuning(
+    chunkSize: 4 * 1024 * 1024,
+    maxChunks: 32,
+    maxConcurrentReads: 6,
+    maxConcurrentPrefetch: 5,
+    prefetchAheadChunks: 10,
+  );
+
+  static const androidQuarkAdaptive = CloudRangeRelayTuning(
+    chunkSize: 4 * 1024 * 1024,
+    maxChunks: 48,
+    maxConcurrentReads: 6,
+    maxConcurrentPrefetch: 5,
+    prefetchAheadChunks: 10,
+    adaptivePolicy: CloudRangeRelayAdaptivePolicy(
+      maxConcurrentReads: 8,
+      maxConcurrentPrefetch: 7,
+      prefetchAheadChunks: 14,
+    ),
+  );
+
+  static const androidQuarkMt6877 = CloudRangeRelayTuning(
+    chunkSize: 2 * 1024 * 1024,
+    maxChunks: 64,
+    maxConcurrentReads: 8,
+    maxConcurrentPrefetch: 7,
+    prefetchAheadChunks: 14,
+    adaptivePolicy: CloudRangeRelayAdaptivePolicy(
+      maxConcurrentReads: 10,
+      maxConcurrentPrefetch: 9,
+      prefetchAheadChunks: 18,
+    ),
+  );
+
+  final int chunkSize;
+  final int maxChunks;
+  final int maxConcurrentReads;
+  final int maxConcurrentPrefetch;
+  final int prefetchAheadChunks;
+  final bool prefetchTailOnStart;
+  final CloudRangeRelayAdaptivePolicy? adaptivePolicy;
+
+  static CloudRangeRelayTuning forPlatform(
+    AppPlatformCapabilities capabilities,
+  ) {
+    if (!capabilities.isAndroid) return windows;
+    return capabilities.isAndroidTv ? androidTv : android;
+  }
+}
+
+class CloudRangeRelaySession implements CloudPlaybackLease {
+  CloudRangeRelaySession._({
+    required CloudRangeRemoteReader reader,
+    required this.directory,
+    required this.providerName,
+    required this.tuning,
+    required this.chunkSize,
+    required this.maxChunks,
+    required CloudRangeRelayLog log,
+  })  : _reader = reader,
+        _log = log,
+        _scheduler = _ReadScheduler(
+          maxConcurrent: tuning.maxConcurrentReads,
+          maxConcurrentPrefetch: tuning.maxConcurrentPrefetch,
+        );
+
+  static Future<CloudRangeRelaySession> start({
+    required CloudRangeRemoteReader reader,
+    required Directory directory,
+    required String providerName,
+    CloudRangeRelayTuning tuning = CloudRangeRelayTuning.windows,
+    int? chunkSize,
+    int? maxChunks,
+    CloudRangeRelayLog? log,
+  }) async {
+    final session = CloudRangeRelaySession._(
+      reader: reader,
+      directory: directory,
+      providerName: providerName,
+      tuning: tuning,
+      chunkSize: chunkSize ?? tuning.chunkSize,
+      maxChunks: maxChunks ?? tuning.maxChunks,
+      log: log ?? ((message) => AppLogger().i(message)),
+    );
+    try {
+      await session._start();
+      return session;
+    } on Object {
+      await session.close();
+      rethrow;
+    }
+  }
+
+  final CloudRangeRemoteReader _reader;
+  final Directory directory;
+  final String providerName;
+  final CloudRangeRelayTuning tuning;
+  final int chunkSize;
+  final int maxChunks;
+  final CloudRangeRelayLog _log;
+  final _ReadScheduler _scheduler;
+  final StreamController<CloudRangeRelayStatus> _statuses =
+      StreamController<CloudRangeRelayStatus>.broadcast(sync: true);
+  final Queue<_TransferSample> _transferSamples = Queue<_TransferSample>();
+  final Set<Future<void>> _prefetchTasks = <Future<void>>{};
+  final Set<Future<void>> _requestTasks = <Future<void>>{};
+
+  CloudRangeChunkCache? _cache;
+  HttpServer? _server;
+  StreamSubscription<CloudRangeReaderEvent>? _readerEvents;
+  late Uri _uri;
+  late var _status = CloudRangeRelayStatus(
+    providerName: providerName,
+    phase: CloudRangeRelayPhase.connecting,
+  );
+  late int _totalLength;
+  var _supportsRanges = false;
+  var _receivedBytes = 0;
+  var _prefetchGeneration = 0;
+  var _adaptiveMode = CloudRangeRelayAdaptiveMode.base;
+  int? _lastForegroundChunk;
+  var _closed = false;
+  Future<void>? _closeFuture;
+
+  Uri get uri => _uri;
+  int get totalLength => _totalLength;
+  String get contentType => _reader.contentType;
+  CloudRangeRelayAdaptiveMode get adaptiveMode => _adaptiveMode;
+  int get currentMaxConcurrentReads => _scheduler.maxConcurrent;
+  int get currentMaxConcurrentPrefetch => _scheduler.maxConcurrentPrefetch;
+
+  @override
+  CloudRangeRelayStatus get currentStatus => _status;
+
+  @override
+  Stream<CloudRangeRelayStatus> get statuses => _statuses.stream;
+
+  Future<void> _start() async {
+    _readerEvents = _reader.events.listen((event) {
+      if (event == CloudRangeReaderEvent.reconnecting ||
+          event == CloudRangeReaderEvent.refreshing) {
+        _returnToBase(event.name);
+        _publish(
+          phase: CloudRangeRelayPhase.reconnecting,
+          message: '$providerName正在重新连接',
+        );
+      }
+    });
+    final metadata = await _reader.probe();
+    if (_closed) throw StateError('中转会话已关闭');
+    _totalLength = metadata.totalLength;
+    _supportsRanges = metadata.supportsRanges;
+    if (_supportsRanges) {
+      _cache = CloudRangeChunkCache(
+        directory: directory,
+        totalLength: metadata.totalLength,
+        chunkSize: chunkSize,
+        maxChunks: maxChunks,
+      );
+    }
+    final server = await HttpServer.bind(
+      InternetAddress.loopbackIPv4,
+      0,
+      shared: false,
+    );
+    _server = server;
+    final token = _createToken();
+    _uri = Uri(
+      scheme: 'http',
+      host: InternetAddress.loopbackIPv4.address,
+      port: server.port,
+      path: '/$token',
+    );
+    server.listen((request) {
+      late final Future<void> task;
+      task = _handleRequest(request).whenComplete(() {
+        _requestTasks.remove(task);
+      });
+      _requestTasks.add(task);
+    });
+    if (_supportsRanges) {
+      _publish(
+        phase: CloudRangeRelayPhase.prefetching,
+        message: '$providerName预缓冲中',
+      );
+      _launchPrefetch(0, _prefetchGeneration);
+      if (tuning.prefetchTailOnStart && metadata.totalLength > chunkSize) {
+        final tailOffset =
+            ((metadata.totalLength - 1) ~/ chunkSize) * chunkSize;
+        _launchPrefetch(tailOffset, _prefetchGeneration);
+      }
+    } else {
+      _publish(
+        phase: CloudRangeRelayPhase.ready,
+        message: '$providerName仅支持顺序播放，拖动不可用',
+      );
+    }
+  }
+
+  String _createToken() {
+    final random = Random.secure();
+    return <int>[for (var index = 0; index < 16; index++) random.nextInt(256)]
+        .map((byte) => byte.toRadixString(16).padLeft(2, '0'))
+        .join();
+  }
+
+  Future<void> _handleRequest(HttpRequest request) async {
+    final response = request.response..bufferOutput = false;
+    try {
+      if (!_isAuthorizedLocalRequest(request)) {
+        await _emptyResponse(response, HttpStatus.notFound);
+        return;
+      }
+      if (request.method != 'GET' && request.method != 'HEAD') {
+        response.headers.set(HttpHeaders.allowHeader, 'GET, HEAD');
+        await _emptyResponse(response, HttpStatus.methodNotAllowed);
+        return;
+      }
+
+      _setCommonHeaders(response);
+      if (request.method == 'HEAD') {
+        response
+          ..statusCode = HttpStatus.ok
+          ..contentLength = totalLength;
+        await response.close();
+        return;
+      }
+
+      final rangeHeader = request.headers.value(HttpHeaders.rangeHeader);
+      if (!_supportsRanges) {
+        if (rangeHeader != null) {
+          try {
+            final requested = parseSingleHttpRange(rangeHeader, totalLength);
+            if (requested.start != 0 ||
+                requested.endInclusive != totalLength - 1) {
+              throw RangeNotSatisfiable(totalLength);
+            }
+          } on RangeNotSatisfiable catch (error) {
+            response.headers.set(
+              HttpHeaders.contentRangeHeader,
+              error.contentRange,
+            );
+            await _emptyResponse(
+              response,
+              HttpStatus.requestedRangeNotSatisfiable,
+            );
+            return;
+          }
+        }
+        response
+          ..statusCode = HttpStatus.ok
+          ..contentLength = totalLength;
+        await _reader.streamAll(response);
+        await response.close();
+        _publish(phase: CloudRangeRelayPhase.ready);
+        return;
+      }
+      late final ByteRange range;
+      if (rangeHeader == null) {
+        range = ByteRange(0, totalLength - 1);
+        response.statusCode = HttpStatus.ok;
+      } else {
+        try {
+          range = parseSingleHttpRange(rangeHeader, totalLength);
+        } on RangeNotSatisfiable catch (error) {
+          response.headers.set(
+            HttpHeaders.contentRangeHeader,
+            error.contentRange,
+          );
+          await _emptyResponse(
+            response,
+            HttpStatus.requestedRangeNotSatisfiable,
+          );
+          return;
+        }
+        response
+          ..statusCode = HttpStatus.partialContent
+          ..headers.set(
+            HttpHeaders.contentRangeHeader,
+            range.contentRange(totalLength),
+          );
+      }
+      response.contentLength = range.length;
+      await _serveRange(response, range);
+      await response.close();
+    } on Object catch (error) {
+      if (error is CloudRangeRemoteProtocolException ||
+          error is CloudRangeRemoteAuthenticationException ||
+          error is CloudRangeRemoteTransportException ||
+          error is CloudChunkLoadException) {
+        _publish(
+          phase: CloudRangeRelayPhase.failed,
+          message: '$providerName分段读取失败',
+        );
+      }
+      try {
+        response
+          ..statusCode = HttpStatus.badGateway
+          ..contentLength = 0;
+      } on Object {
+        // 响应已经开始时只能关闭连接，不能再修改状态码。
+      }
+      try {
+        await response.close();
+      } on Object {
+        // 客户端主动断开不影响中转会话继续服务其他请求。
+      }
+    }
+  }
+
+  bool _isAuthorizedLocalRequest(HttpRequest request) {
+    if (request.connectionInfo?.remoteAddress.address !=
+        InternetAddress.loopbackIPv4.address) {
+      return false;
+    }
+    final host = request.headers.host?.toLowerCase();
+    return host == InternetAddress.loopbackIPv4.address &&
+        request.uri.path == _uri.path;
+  }
+
+  void _setCommonHeaders(HttpResponse response) {
+    if (_supportsRanges) {
+      response.headers.set(HttpHeaders.acceptRangesHeader, 'bytes');
+    }
+    response.headers
+      ..set(HttpHeaders.contentTypeHeader, contentType)
+      ..set(HttpHeaders.cacheControlHeader, 'no-store');
+  }
+
+  Future<void> _emptyResponse(HttpResponse response, int statusCode) async {
+    response
+      ..statusCode = statusCode
+      ..contentLength = 0;
+    await response.close();
+  }
+
+  Future<void> _serveRange(HttpResponse response, ByteRange requested) async {
+    final generation = _noteForegroundRequest(requested.start);
+    var current = requested.start;
+    while (current <= requested.endInclusive && !_closed) {
+      final handle = await _acquireChunk(
+        current,
+        priority: _ReadPriority.foreground,
+      );
+      try {
+        final end = handle.range.endInclusive < requested.endInclusive
+            ? handle.range.endInclusive
+            : requested.endInclusive;
+        await response.addStream(
+          handle.openRead(start: current, endInclusive: end),
+        );
+        current = end + 1;
+        _launchSequentialPrefetch(handle.range, generation);
+      } finally {
+        await handle.release();
+      }
+    }
+  }
+
+  int _noteForegroundRequest(int offset) {
+    final chunkIndex = offset ~/ chunkSize;
+    final previous = _lastForegroundChunk;
+    if (previous != null && (chunkIndex - previous).abs() > 1) {
+      _prefetchGeneration++;
+    }
+    _lastForegroundChunk = chunkIndex;
+    return _prefetchGeneration;
+  }
+
+  Future<CloudRangeChunkHandle> _acquireChunk(
+    int offset, {
+    required _ReadPriority priority,
+  }) async {
+    final cache = _cache!;
+    final handle = await cache.acquire(
+      offset,
+      (range, destination) async {
+        await _scheduler.run(priority, () async {
+          final stopwatch = Stopwatch()..start();
+          await _reader.readTo(range, destination);
+          stopwatch.stop();
+          _recordTransfer(range.length, stopwatch.elapsed);
+        });
+      },
+      onAccess: (access) {
+        if (priority == _ReadPriority.foreground &&
+            access != CloudRangeChunkAccess.cached) {
+          _boostForForegroundPressure();
+        }
+      },
+    );
+    _publish(phase: CloudRangeRelayPhase.ready);
+    return handle;
+  }
+
+  void _launchSequentialPrefetch(ByteRange current, int generation) {
+    for (var distance = 1; distance <= _prefetchAheadChunks; distance++) {
+      final offset = current.start + distance * chunkSize;
+      if (offset < totalLength) _launchPrefetch(offset, generation);
+    }
+  }
+
+  int get _prefetchAheadChunks =>
+      _adaptiveMode == CloudRangeRelayAdaptiveMode.boosted
+          ? tuning.adaptivePolicy!.prefetchAheadChunks
+          : tuning.prefetchAheadChunks;
+
+  void _boostForForegroundPressure() {
+    final policy = tuning.adaptivePolicy;
+    if (_closed ||
+        policy == null ||
+        _adaptiveMode == CloudRangeRelayAdaptiveMode.boosted) {
+      return;
+    }
+    _adaptiveMode = CloudRangeRelayAdaptiveMode.boosted;
+    _scheduler.updateLimits(
+      maxConcurrent: policy.maxConcurrentReads,
+      maxConcurrentPrefetch: policy.maxConcurrentPrefetch,
+    );
+    _logAdaptiveTransition('foreground_cache_pressure');
+  }
+
+  void _returnToBase(String reason) {
+    if (_closed || _adaptiveMode == CloudRangeRelayAdaptiveMode.base) return;
+    _adaptiveMode = CloudRangeRelayAdaptiveMode.base;
+    _scheduler.updateLimits(
+      maxConcurrent: tuning.maxConcurrentReads,
+      maxConcurrentPrefetch: tuning.maxConcurrentPrefetch,
+    );
+    _logAdaptiveTransition(reason);
+  }
+
+  void _logAdaptiveTransition(String reason) {
+    _log(
+      'CloudRangeRelaySession: provider=$providerName '
+      'mode=${_adaptiveMode.name} '
+      'maxReads=$currentMaxConcurrentReads '
+      'maxPrefetch=$currentMaxConcurrentPrefetch reason=$reason',
+    );
+  }
+
+  void _launchPrefetch(int offset, int generation) {
+    if (_closed || offset < 0 || offset >= totalLength) return;
+    late final Future<void> task;
+    task = _prefetch(offset, generation)
+        .catchError((Object _) {})
+        .whenComplete(() => _prefetchTasks.remove(task));
+    _prefetchTasks.add(task);
+  }
+
+  Future<void> _prefetch(int offset, int generation) async {
+    if (_closed || generation != _prefetchGeneration) return;
+    final handle = await _acquireChunk(
+      offset,
+      priority: _ReadPriority.prefetch,
+    );
+    await handle.release();
+  }
+
+  void _recordTransfer(int bytes, Duration elapsed) {
+    final completedAt = DateTime.now();
+    _receivedBytes += bytes;
+    _transferSamples.add(
+      _TransferSample(
+        startedAt: completedAt.subtract(elapsed),
+        completedAt: completedAt,
+        bytes: bytes,
+      ),
+    );
+    final cutoff = completedAt.subtract(const Duration(seconds: 5));
+    while (_transferSamples.isNotEmpty &&
+        _transferSamples.first.completedAt.isBefore(cutoff)) {
+      _transferSamples.removeFirst();
+    }
+  }
+
+  double get _bytesPerSecond {
+    if (_transferSamples.isEmpty) return 0;
+    var bytes = 0;
+    var startedAt = _transferSamples.first.startedAt;
+    var completedAt = _transferSamples.first.completedAt;
+    for (final sample in _transferSamples) {
+      bytes += sample.bytes;
+      if (sample.startedAt.isBefore(startedAt)) startedAt = sample.startedAt;
+      if (sample.completedAt.isAfter(completedAt)) {
+        completedAt = sample.completedAt;
+      }
+    }
+    final microseconds = completedAt.difference(startedAt).inMicroseconds;
+    if (bytes == 0 || microseconds <= 0) return 0;
+    return bytes * Duration.microsecondsPerSecond / microseconds;
+  }
+
+  void _publish({
+    required CloudRangeRelayPhase phase,
+    String? message,
+  }) {
+    if (_closed || _statuses.isClosed) return;
+    final status = CloudRangeRelayStatus(
+      providerName: providerName,
+      phase: phase,
+      bytesPerSecond: _bytesPerSecond,
+      receivedBytes: _receivedBytes,
+      cachedBytes: _cache?.cachedBytes ?? 0,
+      message: message,
+    );
+    _status = status;
+    _statuses.add(status);
+  }
+
+  @override
+  Future<void> close() => _closeFuture ??= _close();
+
+  Future<void> _close() async {
+    _closed = true;
+    if (tuning.adaptivePolicy != null) {
+      _log(
+        'CloudRangeRelaySession: provider=$providerName '
+        'event=session_closed receivedBytes=$_receivedBytes '
+        'mode=${_adaptiveMode.name}',
+      );
+    }
+    _prefetchGeneration++;
+    await _server?.close(force: true);
+    _scheduler.close();
+    await _readerEvents?.cancel();
+    await _reader.close();
+    for (final task in _requestTasks.toList()) {
+      try {
+        await task;
+      } on Object {
+        // 关闭中被取消的本机请求无需继续传播。
+      }
+    }
+    for (final task in _prefetchTasks.toList()) {
+      try {
+        await task;
+      } on Object {
+        // 关闭中被取消的预取无需继续传播。
+      }
+    }
+    await _cache?.close();
+    if (_cache == null && await directory.exists()) {
+      await directory.delete(recursive: true);
+    }
+    await _statuses.close();
+  }
+}
+
+enum _ReadPriority { foreground, prefetch }
+
+class _ReadScheduler {
+  _ReadScheduler({
+    required int maxConcurrent,
+    required int maxConcurrentPrefetch,
+  })  : assert(maxConcurrent > 0),
+        assert(maxConcurrentPrefetch >= 0),
+        assert(maxConcurrentPrefetch < maxConcurrent),
+        _maxConcurrent = maxConcurrent,
+        _maxConcurrentPrefetch = maxConcurrentPrefetch;
+
+  int _maxConcurrent;
+  int _maxConcurrentPrefetch;
+  final Queue<_ScheduledRead> _foreground = Queue<_ScheduledRead>();
+  final Queue<_ScheduledRead> _prefetch = Queue<_ScheduledRead>();
+  var _active = 0;
+  var _activePrefetch = 0;
+  var _closed = false;
+
+  int get maxConcurrent => _maxConcurrent;
+  int get maxConcurrentPrefetch => _maxConcurrentPrefetch;
+
+  void updateLimits({
+    required int maxConcurrent,
+    required int maxConcurrentPrefetch,
+  }) {
+    if (_closed) return;
+    if (maxConcurrent <= 0 ||
+        maxConcurrentPrefetch < 0 ||
+        maxConcurrentPrefetch >= maxConcurrent) {
+      throw ArgumentError('读取并发参数无效');
+    }
+    _maxConcurrent = maxConcurrent;
+    _maxConcurrentPrefetch = maxConcurrentPrefetch;
+    _drain();
+  }
+
+  Future<void> run(_ReadPriority priority, Future<void> Function() action) {
+    if (_closed) return Future<void>.error(StateError('远程读取调度器已关闭'));
+    final scheduled = _ScheduledRead(priority, action);
+    switch (priority) {
+      case _ReadPriority.foreground:
+        _foreground.add(scheduled);
+      case _ReadPriority.prefetch:
+        _prefetch.add(scheduled);
+    }
+    _drain();
+    return scheduled.completer.future;
+  }
+
+  void _drain() {
+    while (!_closed && _active < maxConcurrent) {
+      final scheduled = _foreground.isNotEmpty
+          ? _foreground.removeFirst()
+          : _prefetch.isNotEmpty && _activePrefetch < maxConcurrentPrefetch
+              ? _prefetch.removeFirst()
+              : null;
+      if (scheduled == null) return;
+      _active++;
+      if (scheduled.priority == _ReadPriority.prefetch) {
+        _activePrefetch++;
+      }
+      scheduled.action().then(
+        (_) => scheduled.completer.complete(),
+        onError: (Object error, StackTrace stackTrace) {
+          scheduled.completer.completeError(error, stackTrace);
+        },
+      ).whenComplete(() {
+        _active--;
+        if (scheduled.priority == _ReadPriority.prefetch) {
+          _activePrefetch--;
+        }
+        _drain();
+      });
+    }
+  }
+
+  void close() {
+    if (_closed) return;
+    _closed = true;
+    final error = StateError('远程读取调度器已关闭');
+    for (final queue in <Queue<_ScheduledRead>>[_foreground, _prefetch]) {
+      while (queue.isNotEmpty) {
+        queue.removeFirst().completer.completeError(error);
+      }
+    }
+  }
+}
+
+class _ScheduledRead {
+  _ScheduledRead(this.priority, this.action);
+
+  final _ReadPriority priority;
+  final Future<void> Function() action;
+  final Completer<void> completer = Completer<void>();
+}
+
+class _TransferSample {
+  const _TransferSample({
+    required this.startedAt,
+    required this.completedAt,
+    required this.bytes,
+  });
+
+  final DateTime startedAt;
+  final DateTime completedAt;
+  final int bytes;
+}

@@ -1,0 +1,585 @@
+import 'package:kanyingyin/modules/media/media_name_analysis.dart';
+
+class MediaNameAnalyzer {
+  const MediaNameAnalyzer();
+
+  static final RegExp _advertisementPattern = RegExp(
+    r'更多.*(?:资源|访问)|全网搜索|防走失|神秘入口|请访问|'
+    r'(?:www\.|https?://)|(?:^|[\s._-])[\w-]+\.(?:vip|com|net)(?:$|[\s._-])',
+    caseSensitive: false,
+    unicode: true,
+  );
+  static final RegExp _versionPattern = RegExp(
+    r'导演剪辑版|加长版|重剪版|最终章',
+    caseSensitive: false,
+    unicode: true,
+  );
+  static final RegExp _theatricalPattern = RegExp(
+    r'剧场版|\bThe[\s._-]+Movie\b|\bMovie\b',
+    caseSensitive: false,
+    unicode: true,
+  );
+  static final RegExp _ovaPattern = RegExp(r'\bOVA\b', caseSensitive: false);
+  static final RegExp _oadPattern = RegExp(r'\bOAD\b', caseSensitive: false);
+  static final RegExp _specialPattern = RegExp(
+    r'特别篇|特别版|\bSpecial\b',
+    caseSensitive: false,
+    unicode: true,
+  );
+  static final RegExp _seasonEpisodePattern = RegExp(
+    r'\bS(\d{1,2})E(\d{1,3})(?:\s*[-~]\s*E?(\d{1,3}))?\b',
+    caseSensitive: false,
+  );
+  static final RegExp _chineseSeasonEpisodePattern = RegExp(
+    r'第\s*([零〇一二两三四五六七八九十\d]{1,3})\s*[季部]\s*'
+    r'第\s*(\d{1,3})(?:\s*[-~至]\s*(\d{1,3}))?\s*[话話集]',
+    caseSensitive: false,
+    unicode: true,
+  );
+  static final RegExp _seasonPattern = RegExp(
+    r'(?:第\s*([零〇一二两三四五六七八九十\d]{1,3})\s*[季部]|'
+    r'\bSeason\s*(\d{1,2})\b|\bS(\d{1,2})(?!E\d))',
+    caseSensitive: false,
+    unicode: true,
+  );
+  static final RegExp _chineseEpisodePattern = RegExp(
+    r'第\s*(\d{1,3})(?:\s*[-~至]\s*(\d{1,3}))?\s*[话話集]',
+    caseSensitive: false,
+    unicode: true,
+  );
+  static final RegExp _englishEpisodePattern = RegExp(
+    r'(?:^|[\s._-])(?:EP?|Episode)\s*(\d{1,3})(?!\d)',
+    caseSensitive: false,
+  );
+  static final RegExp _delimitedEpisodePattern = RegExp(
+    r'\s+[-–—]\s+(\d{1,3})(?!\d)',
+    caseSensitive: false,
+    unicode: true,
+  );
+  static final RegExp _bracketedEpisodePattern = RegExp(
+    r'\[(\d{1,3})\]',
+  );
+  static final RegExp _standaloneEpisodePattern = RegExp(
+    r'^(?:EP?|Episode)?\s*(\d{1,3})\s*$',
+    caseSensitive: false,
+  );
+  static final RegExp _concatenatedEpisodePattern = RegExp(
+    r'^(.+?[A-Za-z\u3400-\u9FFF])(\d{2})$',
+    unicode: true,
+  );
+  static final RegExp _resolutionPattern = RegExp(
+    r'\b(360p|480p|576p|720p|1080p|1440p|2160p|4K|8K)\b',
+    caseSensitive: false,
+  );
+  static final RegExp _sourcePattern = RegExp(
+    r'\b(WEB[\s._-]?DL|WEBRip|REMUX|BDMV|BDRip|BluRay|UHD(?:\s*BluRay)?|BD|TVRip|HDTV|DVDRip|HD-DVD|NF|AMZN|DSNP|ATVP|HMAX|HULU|CR)\b',
+    caseSensitive: false,
+  );
+  static final RegExp _codecPattern = RegExp(
+    r'(?<![A-Za-z0-9])(x264|x265|xvid|H264|H265|HEVC|AVC|AV1|VP9|MPEG[\s._-]*2|MPEG[\s._-]*4)(?![A-Za-z0-9])',
+    caseSensitive: false,
+  );
+  static final RegExp _audioCodecPattern = RegExp(
+    r'(?<![A-Za-z0-9])(TrueHD|DTS[\s._-]*(?:HD[\s._-]*MA|X)?[\s._-]*\d(?:\.\d)?|DTS[\s._-]*(?:HD[\s._-]*MA|X)?|AC-?3|AAC|FLAC|LPCM|MP3|Opus|Vorbis)(?![A-Za-z0-9])',
+    caseSensitive: false,
+  );
+  static final RegExp _audioTrackCountPattern = RegExp(
+    r'(?<![A-Za-z0-9])\d{1,2}[\s._-]*Audio(?![A-Za-z0-9])',
+    caseSensitive: false,
+  );
+  static final RegExp _bitDepthPattern = RegExp(
+    r'(?<![A-Za-z0-9])(?:Main10|8bit|10bit|12bit)(?![A-Za-z0-9])',
+    caseSensitive: false,
+  );
+  static final RegExp _trailingChecksumPattern = RegExp(
+    r'\[[0-9A-F]{8}\]\s*$',
+    caseSensitive: false,
+  );
+  static final RegExp _dvPattern = RegExp(
+    r'\b(?:DV|Dolby[\s._-]*Vision)\b',
+    caseSensitive: false,
+  );
+  static final RegExp _hdrPattern = RegExp(
+    r'(?<![A-Za-z0-9])(?:HDR(?:10(?:\+|Plus)?)?|HLG)(?![A-Za-z0-9])',
+    caseSensitive: false,
+  );
+  static final RegExp _ddpPattern = RegExp(
+    r'\b(?:DDP|EAC3)(?:[\s._-]*(\d(?:\.\d)?))?\b',
+    caseSensitive: false,
+  );
+  static final RegExp _atmosPattern = RegExp(
+    r'\bAtmos\b',
+    caseSensitive: false,
+  );
+  static final RegExp _bitratePattern = RegExp(
+    r'高码率|低码率|(?<![A-Za-z0-9])HQ(?![A-Za-z0-9])|(?<![A-Za-z0-9])LQ(?![A-Za-z0-9])',
+    caseSensitive: false,
+    unicode: true,
+  );
+  static final RegExp _subtitlePattern = RegExp(
+    r'(?:内封|内嵌)(?:简繁英|简繁|简中|繁中|简体中字|繁体中字|中文字幕|中字|双语字幕|字幕)',
+    caseSensitive: false,
+    unicode: true,
+  );
+  static final RegExp _subtitleTrackCountPattern = RegExp(
+    r'\b(?:SRT|ASS|SSA|VTT)\s*[x×]\s*\d+\b',
+    caseSensitive: false,
+    unicode: true,
+  );
+  static final RegExp _languagePattern = RegExp(
+    r'国语|国配|日语|粤语|英语|双语',
+    caseSensitive: false,
+    unicode: true,
+  );
+  static final RegExp _yearPattern = RegExp(
+    r'(?:^|[\s._（(])((?:19|20)\d{2})(?=$|[\s._）)])',
+  );
+  static final RegExp _leadingReleaseGroupPattern = RegExp(
+    r'^(?:\[([^\]]{2,32})\]|【([^】]{2,32})】)',
+    unicode: true,
+  );
+  static final RegExp _trailingReleaseGroupPattern = RegExp(
+    r'(?:[-._ ](?:SGF|FGT|LeloveTV|BlackTV|DreamHD|HotWEB|ColorTV|ZeroTV|Huawei|Xiaomi|SSDSSE))\s*$',
+    caseSensitive: false,
+  );
+  static final RegExp _transparentDirectoryPattern = RegExp(
+    r'^(?:(?:内嵌|内封)[\s._-]*)?'
+    r'(?:中字|中文字幕|简中|繁中|简体中字|繁体中字|字幕|外挂字幕|双语字幕)'
+    r'(?:版|版本)?$|^(?:sub|subs|subtitle|subtitles)$|'
+    r'^(?:高码率|低码率|原画|超清)$',
+    caseSensitive: false,
+    unicode: true,
+  );
+
+  MediaNameAnalysis analyze(
+    String name, {
+    required bool isDirectory,
+  }) {
+    final baseName = isDirectory ? name.trim() : _withoutExtension(name);
+    final normalized = _normalize(baseName);
+    if (_advertisementPattern.hasMatch(normalized)) {
+      return MediaNameAnalysis(
+        originalName: name,
+        role: MediaNodeRole.advertisement,
+        confidence: 1,
+        evidence: const <String>['advertisement-token'],
+      );
+    }
+
+    final releaseTags = _releaseTags(normalized);
+    final contentHint = _contentHint(normalized);
+    final transparentDirectory =
+        isDirectory && isTransparentDirectoryName(normalized);
+    final versionMatch = _versionPattern.firstMatch(normalized);
+    final seasonEpisode = _seasonEpisodePattern.firstMatch(normalized);
+    final chineseSeasonEpisode =
+        _chineseSeasonEpisodePattern.firstMatch(normalized);
+    final season = _seasonPattern.firstMatch(normalized);
+    final chineseEpisode = _chineseEpisodePattern.firstMatch(normalized);
+    final englishEpisode = _englishEpisodePattern.firstMatch(normalized);
+    final delimitedEpisode = _delimitedEpisodePattern.firstMatch(normalized);
+    final bracketedEpisode = _bracketedEpisodePattern.firstMatch(normalized);
+    final standaloneEpisode = _standaloneEpisodePattern.firstMatch(normalized);
+    final hasExplicitEpisode = seasonEpisode != null ||
+        chineseSeasonEpisode != null ||
+        chineseEpisode != null ||
+        englishEpisode != null ||
+        delimitedEpisode != null ||
+        bracketedEpisode != null ||
+        standaloneEpisode != null;
+    final concatenatedEpisode = isDirectory || hasExplicitEpisode
+        ? null
+        : _concatenatedEpisodePattern.firstMatch(normalized);
+
+    final seasonNumber = _firstPositive(<String?>[
+      seasonEpisode?.group(1),
+      chineseSeasonEpisode?.group(1),
+      season?.group(1),
+      season?.group(2),
+      season?.group(3),
+    ]);
+    final episodeNumber = _firstPositive(<String?>[
+      seasonEpisode?.group(2),
+      chineseSeasonEpisode?.group(2),
+      chineseEpisode?.group(1),
+      englishEpisode?.group(1),
+      delimitedEpisode?.group(1),
+      bracketedEpisode?.group(1),
+      standaloneEpisode?.group(1),
+      concatenatedEpisode?.group(2),
+    ]);
+    final episodeEndNumber = _firstPositive(<String?>[
+      seasonEpisode?.group(3),
+      chineseSeasonEpisode?.group(3),
+      chineseEpisode?.group(2),
+    ]);
+
+    final role = transparentDirectory
+        ? MediaNodeRole.version
+        : versionMatch != null
+            ? MediaNodeRole.version
+            : episodeNumber != null
+                ? MediaNodeRole.episode
+                : seasonNumber != null
+                    ? MediaNodeRole.season
+                    : normalized.isEmpty
+                        ? MediaNodeRole.unknown
+                        : MediaNodeRole.work;
+    final titleCandidates = transparentDirectory
+        ? const <String>[]
+        : _titleCandidates(
+            normalized,
+            role: role,
+            releaseTags: releaseTags,
+            hasConcatenatedEpisode: concatenatedEpisode != null,
+          );
+    final evidence = <String>[
+      if (versionMatch != null) _versionEvidence(versionMatch.group(0)!),
+      if (seasonNumber != null) 'season-token',
+      if (episodeNumber != null) 'episode-token',
+      if (releaseTags.resolution != null) 'resolution-token',
+      if (releaseTags.source != null) 'source-token',
+      if (releaseTags.codec != null) 'codec-token',
+    ];
+
+    return MediaNameAnalysis(
+      originalName: name,
+      role: role,
+      titleCandidates: titleCandidates,
+      seasonNumber: seasonNumber,
+      episodeNumber: episodeNumber,
+      episodeEndNumber: episodeEndNumber,
+      year: _year(normalized),
+      releaseTags: releaseTags,
+      contentHint: contentHint,
+      confidence: switch (role) {
+        MediaNodeRole.advertisement => 1,
+        MediaNodeRole.season ||
+        MediaNodeRole.episode ||
+        MediaNodeRole.version =>
+          0.9,
+        MediaNodeRole.work => 0.7,
+        MediaNodeRole.unknown => 0,
+      },
+      evidence: evidence,
+    );
+  }
+
+  String cleanReleaseTokens(String value) {
+    return value
+        .replaceAll(_resolutionPattern, ' ')
+        .replaceAll(_sourcePattern, ' ')
+        .replaceAll(_codecPattern, ' ')
+        .replaceAll(_audioCodecPattern, ' ')
+        .replaceAll(_audioTrackCountPattern, ' ')
+        .replaceAll(_bitDepthPattern, ' ')
+        .replaceAll(_trailingChecksumPattern, ' ')
+        .replaceAll(_dvPattern, ' ')
+        .replaceAll(_hdrPattern, ' ')
+        .replaceAll(_ddpPattern, ' ')
+        .replaceAll(_atmosPattern, ' ')
+        .replaceAll(_bitratePattern, ' ')
+        .replaceAll(_subtitlePattern, ' ')
+        .replaceAll(_subtitleTrackCountPattern, ' ')
+        .replaceAll(_languagePattern, ' ')
+        .replaceAll(_trailingReleaseGroupPattern, ' ')
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim();
+  }
+
+  bool isTransparentDirectoryName(String name) {
+    final normalized = _normalize(name);
+    if (_transparentDirectoryPattern.hasMatch(normalized)) return true;
+    final remaining = normalized
+        .replaceAll(RegExp(r'[\[\]【】()（）《》]', unicode: true), ' ')
+        .replaceAll(RegExp(r'全\s*\d+\s*集|全集', unicode: true), ' ')
+        .replaceAll(_resolutionPattern, ' ')
+        .replaceAll(_bitratePattern, ' ')
+        .replaceAll(_subtitlePattern, ' ')
+        .replaceAll(RegExp(r'[\s._&+\-–—]+', unicode: true), '')
+        .trim();
+    return remaining.isEmpty;
+  }
+
+  String _withoutExtension(String value) {
+    return value.replaceFirst(RegExp(r'\.[^.\\/]+$'), '').trim();
+  }
+
+  String _normalize(String value) {
+    return value
+        .replaceAll(RegExp(r'[\u3000]+', unicode: true), ' ')
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim();
+  }
+
+  MediaReleaseTags _releaseTags(String value) {
+    final resolution = _resolutionPattern.firstMatch(value)?.group(1);
+    final source = _sourcePattern.firstMatch(value)?.group(1);
+    final codec = _codecPattern.firstMatch(value)?.group(1);
+    final bitrate = _bitratePattern.firstMatch(value)?.group(0);
+    final ddp = _ddpPattern.firstMatch(value);
+    final audioCodecs = _audioCodecPattern
+        .allMatches(value)
+        .map((match) => _canonicalAudioCodec(match.group(1)!))
+        .toSet();
+    final subtitles = _subtitlePattern
+        .allMatches(value)
+        .map((match) => match.group(0)!)
+        .toSet()
+        .toList(growable: false);
+    final subtitleTracks = _subtitleTrackCountPattern
+        .allMatches(value)
+        .map((match) => match.group(0)!)
+        .toSet();
+    final releaseGroup = _releaseGroup(value);
+    return MediaReleaseTags(
+      resolution: _canonicalResolution(resolution),
+      bitrate: bitrate,
+      source: _canonicalSource(source),
+      codec: codec?.toUpperCase(),
+      dynamicRange: <String>[
+        if (_dvPattern.hasMatch(value)) 'DV',
+        if (_hdrPattern.hasMatch(value)) 'HDR',
+      ],
+      audio: <String>[
+        if (ddp != null) ddp.group(1) == null ? 'DDP' : 'DDP ${ddp.group(1)}',
+        ...audioCodecs,
+        if (_atmosPattern.hasMatch(value)) 'Atmos',
+        ..._languagePattern
+            .allMatches(value)
+            .map((match) => match.group(0)!)
+            .toSet(),
+      ],
+      subtitles: <String>[...subtitles, ...subtitleTracks],
+      releaseGroup: releaseGroup,
+    );
+  }
+
+  String? _releaseGroup(String value) {
+    final match = _leadingReleaseGroupPattern.firstMatch(value);
+    final group = (match?.group(1) ?? match?.group(2))?.trim();
+    if (group == null || group.isEmpty) return null;
+    if (_isReleaseNoise(group)) return null;
+    return group;
+  }
+
+  List<String> _titleCandidates(
+    String value, {
+    required MediaNodeRole role,
+    required MediaReleaseTags releaseTags,
+    required bool hasConcatenatedEpisode,
+  }) {
+    final hasStructuralNoise = _hasStructuralNoise(
+      value,
+      releaseTags,
+      hasConcatenatedEpisode: hasConcatenatedEpisode,
+    );
+    if (!hasStructuralNoise && role == MediaNodeRole.work) {
+      return <String>[value];
+    }
+
+    final candidates = <String>[];
+    final quoted = RegExp(r'《([^》]+)》', unicode: true).firstMatch(value);
+    if (quoted != null) {
+      final candidate = _cleanTitle(quoted.group(1)!);
+      if (candidate.isNotEmpty) candidates.add(candidate);
+    }
+    final cleaned = _cleanTitle(
+      value,
+      stripConcatenatedEpisode: hasConcatenatedEpisode,
+    );
+    if (cleaned.isNotEmpty && !candidates.contains(cleaned)) {
+      candidates.add(cleaned);
+    }
+    return candidates;
+  }
+
+  bool _hasStructuralNoise(
+    String value,
+    MediaReleaseTags tags, {
+    required bool hasConcatenatedEpisode,
+  }) {
+    return _seasonEpisodePattern.hasMatch(value) ||
+        _chineseSeasonEpisodePattern.hasMatch(value) ||
+        _seasonPattern.hasMatch(value) ||
+        _chineseEpisodePattern.hasMatch(value) ||
+        _englishEpisodePattern.hasMatch(value) ||
+        _delimitedEpisodePattern.hasMatch(value) ||
+        _bracketedEpisodePattern.hasMatch(value) ||
+        _standaloneEpisodePattern.hasMatch(value) ||
+        hasConcatenatedEpisode ||
+        _versionPattern.hasMatch(value) ||
+        tags.resolution != null ||
+        tags.source != null ||
+        tags.codec != null ||
+        tags.dynamicRange.isNotEmpty ||
+        tags.audio.isNotEmpty ||
+        _audioTrackCountPattern.hasMatch(value) ||
+        _trailingReleaseGroupPattern.hasMatch(value) ||
+        RegExp(r'^\d{4,}[\s._-]+').hasMatch(value) ||
+        RegExp(r'全\s*\d+\s*集|全集|内附', unicode: true).hasMatch(value) ||
+        (_year(value) != null && !RegExp(r'^\d{4}$').hasMatch(value));
+  }
+
+  String _cleanTitle(
+    String value, {
+    bool stripConcatenatedEpisode = false,
+  }) {
+    final structuralValue = stripConcatenatedEpisode
+        ? value.replaceAllMapped(
+            _concatenatedEpisodePattern,
+            (match) => match.group(1)!,
+          )
+        : value;
+    var result = cleanReleaseTokens(structuralValue)
+        .replaceFirst(RegExp(r'^\d{4,}[\s._-]+'), '')
+        .replaceAll(_seasonEpisodePattern, ' ')
+        .replaceAll(_chineseSeasonEpisodePattern, ' ')
+        .replaceAll(_seasonPattern, ' ')
+        .replaceAll(_chineseEpisodePattern, ' ')
+        .replaceAll(_englishEpisodePattern, ' ')
+        .replaceAll(_delimitedEpisodePattern, ' ')
+        .replaceAll(_bracketedEpisodePattern, ' ')
+        .replaceAll(_standaloneEpisodePattern, ' ')
+        .replaceAll(_versionPattern, ' ')
+        .replaceAll(RegExp(r'[（(](?:19|20)\d{2}[)）]'), ' ')
+        .replaceAll(RegExp(r'全\s*\d+\s*集|全集|完结'), ' ')
+        .replaceAll(RegExp(r'内附.*$', unicode: true), ' ')
+        .replaceAll(_leadingReleaseGroupPattern, ' ')
+        .replaceAll(RegExp(r'[《》【】\[\]]', unicode: true), ' ')
+        .replaceAll(RegExp(r'[._]+'), ' ')
+        .replaceAll(RegExp(r'^[\s&+,\-–—:：]+|[\s&+,\-–—:：]+$'), ' ')
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim();
+    if (result != '1923') {
+      result = result.replaceAll(_yearPattern, ' ').replaceAll(
+            RegExp(r'\s+'),
+            ' ',
+          );
+    }
+    return result.trim();
+  }
+
+  int? _year(String value) {
+    if (RegExp(r'^\d{4}$').hasMatch(value)) return null;
+    final match = _yearPattern.firstMatch(value);
+    return match == null ? null : int.tryParse(match.group(1)!);
+  }
+
+  int? _firstPositive(List<String?> values) {
+    for (final value in values) {
+      if (value == null || value.isEmpty) continue;
+      final number = _parseNumber(value);
+      if (number != null && number > 0) return number;
+    }
+    return null;
+  }
+
+  int? _parseNumber(String value) {
+    final arabic = int.tryParse(value);
+    if (arabic != null) return arabic;
+    const digits = <String, int>{
+      '零': 0,
+      '〇': 0,
+      '一': 1,
+      '二': 2,
+      '两': 2,
+      '三': 3,
+      '四': 4,
+      '五': 5,
+      '六': 6,
+      '七': 7,
+      '八': 8,
+      '九': 9,
+    };
+    if (!value.contains('十')) return digits[value];
+    final parts = value.split('十');
+    if (parts.length != 2) return null;
+    final tens = parts.first.isEmpty ? 1 : digits[parts.first];
+    final ones = parts.last.isEmpty ? 0 : digits[parts.last];
+    if (tens == null || ones == null) return null;
+    final result = tens * 10 + ones;
+    return result >= 1 && result <= 99 ? result : null;
+  }
+
+  bool _isReleaseNoise(String value) {
+    return _resolutionPattern.hasMatch(value) ||
+        _sourcePattern.hasMatch(value) ||
+        _codecPattern.hasMatch(value);
+  }
+
+  String? _canonicalResolution(String? value) {
+    if (value == null) return null;
+    final lower = value.toLowerCase();
+    return lower == '4k' || lower == '8k' ? lower.toUpperCase() : lower;
+  }
+
+  String? _canonicalSource(String? value) {
+    if (value == null) return null;
+    return switch (value.toLowerCase().replaceAll(RegExp(r'[\s._]'), '-')) {
+      'web-dl' => 'Web-DL',
+      'webrip' => 'WEBRip',
+      'bdrip' => 'BDRip',
+      'bluray' => 'BluRay',
+      'remux' => 'Remux',
+      'bdmv' => 'BDMV',
+      'uhd-bluray' => 'UHD BluRay',
+      'dvdrip' => 'DVDRip',
+      'hd-dvd' => 'HD-DVD',
+      'nf' => 'Netflix',
+      'amzn' => 'Amazon',
+      'dsnp' => 'Disney+',
+      'atvp' => 'Apple TV+',
+      'hmax' => 'Max',
+      'hulu' => 'Hulu',
+      'cr' => 'Crunchyroll',
+      'bd' => 'BD',
+      'tvrip' => 'TVRip',
+      'hdtv' => 'HDTV',
+      _ => value,
+    };
+  }
+
+  String _canonicalAudioCodec(String value) {
+    final channelMatch = RegExp(
+      r'^DTS[\s._-]*(\d(?:[._]\d)?)$',
+      caseSensitive: false,
+    ).firstMatch(value.trim());
+    if (channelMatch != null) {
+      return 'DTS ${channelMatch.group(1)!.replaceAll('_', '.')}';
+    }
+    final normalized = value.replaceAll(RegExp(r'[\s._-]+'), '').toLowerCase();
+    final dtsChannel = RegExp(r'^dts([0-9].*)$').firstMatch(normalized);
+    if (dtsChannel != null) return 'DTS ${dtsChannel.group(1)}';
+    return switch (normalized) {
+      'truehd' => 'TrueHD',
+      'lpcm' => 'LPCM',
+      'opus' => 'Opus',
+      'vorbis' => 'Vorbis',
+      'aac' => 'AAC',
+      'flac' => 'FLAC',
+      'mp3' => 'MP3',
+      'ac3' => 'AC3',
+      'dts' => 'DTS',
+      'dtshdma' => 'DTS-HD MA',
+      'dtsx' => 'DTS-X',
+      _ => value.toUpperCase(),
+    };
+  }
+
+  String _versionEvidence(String value) {
+    if (value.contains('导演剪辑版')) return 'director-cut';
+    if (value.contains('加长版')) return 'extended-cut';
+    if (value.contains('重剪版')) return 'recut';
+    if (value.contains('特别篇')) return 'special';
+    return 'version';
+  }
+
+  MediaContentHint _contentHint(String value) {
+    if (_theatricalPattern.hasMatch(value)) return MediaContentHint.movie;
+    if (_ovaPattern.hasMatch(value)) return MediaContentHint.ova;
+    if (_oadPattern.hasMatch(value)) return MediaContentHint.oad;
+    if (_specialPattern.hasMatch(value)) return MediaContentHint.special;
+    return MediaContentHint.unknown;
+  }
+}

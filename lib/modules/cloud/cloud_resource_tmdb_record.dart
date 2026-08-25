@@ -1,0 +1,524 @@
+import 'package:kanyingyin/modules/local/tmdb_metadata.dart';
+import 'package:kanyingyin/services/tmdb/tmdb_scrape_subject.dart';
+
+enum CloudResourceKind { directory, standaloneVideo }
+
+enum CloudResourceTmdbStatus { unchecked, matched, unmatched, failed, conflict }
+
+String cloudResourceTmdbKey({
+  required String sourceId,
+  required String remoteId,
+  required String remotePath,
+}) {
+  var normalizedPath = remotePath.trim().replaceAll('\\', '/');
+  normalizedPath = normalizedPath.replaceAll(RegExp(r'/+'), '/');
+  if (normalizedPath.isEmpty) {
+    normalizedPath = '/';
+  } else if (!normalizedPath.startsWith('/')) {
+    normalizedPath = '/$normalizedPath';
+  }
+  if (normalizedPath.length > 1 && normalizedPath.endsWith('/')) {
+    normalizedPath = normalizedPath.substring(0, normalizedPath.length - 1);
+  }
+  return '$sourceId|$remoteId|$normalizedPath';
+}
+
+class CloudResourceTmdbRecord {
+  const CloudResourceTmdbRecord({
+    required this.sourceId,
+    required this.remoteId,
+    required this.remotePath,
+    required this.displayName,
+    required this.resourceKind,
+    required this.status,
+    required this.checkedAt,
+    this.tmdbId,
+    this.mediaType,
+    this.title,
+    this.aliases = const <String>[],
+    this.genres = const <String>[],
+    this.originalTitle,
+    this.overview,
+    this.rating,
+    this.popularity,
+    this.voteCount,
+    this.releaseDate,
+    this.posterUrl,
+    this.backdropUrl,
+    this.posterCachePath,
+    this.customTitle,
+    this.seasons = const <TmdbSeasonMetadata>[],
+    this.tmdbMatchOrigin = TmdbMatchOrigin.legacyUnknown,
+    this.tmdbRuleVersion = 0,
+  });
+
+  factory CloudResourceTmdbRecord.matched({
+    required String sourceId,
+    required String remoteId,
+    required String remotePath,
+    required String displayName,
+    required CloudResourceKind resourceKind,
+    required TmdbMetadata metadata,
+    required DateTime checkedAt,
+    String? posterCachePath,
+    String? customTitle,
+    TmdbMatchOrigin tmdbMatchOrigin = TmdbMatchOrigin.legacyUnknown,
+    int tmdbRuleVersion = 0,
+  }) {
+    return CloudResourceTmdbRecord(
+      sourceId: sourceId,
+      remoteId: remoteId,
+      remotePath: remotePath,
+      displayName: displayName,
+      resourceKind: resourceKind,
+      status: CloudResourceTmdbStatus.matched,
+      checkedAt: checkedAt,
+      tmdbId: metadata.id,
+      mediaType: metadata.mediaType,
+      title: metadata.title,
+      aliases: metadata.aliases,
+      genres: metadata.genres,
+      originalTitle: metadata.originalTitle,
+      overview: metadata.overview,
+      rating: metadata.rating,
+      popularity: metadata.popularity,
+      voteCount: metadata.voteCount,
+      releaseDate: metadata.releaseDate,
+      posterUrl: metadata.posterUrl,
+      backdropUrl: metadata.backdropUrl,
+      posterCachePath: posterCachePath,
+      customTitle: customTitle,
+      seasons: metadata.seasons,
+      tmdbMatchOrigin: tmdbMatchOrigin,
+      tmdbRuleVersion: tmdbRuleVersion,
+    );
+  }
+
+  factory CloudResourceTmdbRecord.unmatched({
+    required String sourceId,
+    required String remoteId,
+    required String remotePath,
+    required String displayName,
+    required CloudResourceKind resourceKind,
+    required DateTime checkedAt,
+    String? customTitle,
+  }) {
+    return CloudResourceTmdbRecord(
+      sourceId: sourceId,
+      remoteId: remoteId,
+      remotePath: remotePath,
+      displayName: displayName,
+      resourceKind: resourceKind,
+      status: CloudResourceTmdbStatus.unmatched,
+      checkedAt: checkedAt,
+      customTitle: customTitle,
+    );
+  }
+
+  factory CloudResourceTmdbRecord.unchecked({
+    required String sourceId,
+    required String remoteId,
+    required String remotePath,
+    required String displayName,
+    required CloudResourceKind resourceKind,
+    required DateTime checkedAt,
+    String? customTitle,
+  }) {
+    return CloudResourceTmdbRecord(
+      sourceId: sourceId,
+      remoteId: remoteId,
+      remotePath: remotePath,
+      displayName: displayName,
+      resourceKind: resourceKind,
+      status: CloudResourceTmdbStatus.unchecked,
+      checkedAt: checkedAt,
+      customTitle: customTitle,
+    );
+  }
+
+  factory CloudResourceTmdbRecord.failed({
+    required String sourceId,
+    required String remoteId,
+    required String remotePath,
+    required String displayName,
+    required CloudResourceKind resourceKind,
+    required DateTime checkedAt,
+    String? customTitle,
+  }) {
+    return CloudResourceTmdbRecord(
+      sourceId: sourceId,
+      remoteId: remoteId,
+      remotePath: remotePath,
+      displayName: displayName,
+      resourceKind: resourceKind,
+      status: CloudResourceTmdbStatus.failed,
+      checkedAt: checkedAt,
+      customTitle: customTitle,
+    );
+  }
+
+  factory CloudResourceTmdbRecord.fromJson(Map<String, Object?> json) {
+    return CloudResourceTmdbRecord(
+      sourceId: json['sourceId'] as String? ?? '',
+      remoteId: json['remoteId'] as String? ?? '',
+      remotePath: json['remotePath'] as String? ?? '/',
+      displayName: json['displayName'] as String? ?? '',
+      resourceKind: _enumValue(
+        CloudResourceKind.values,
+        json['resourceKind'],
+        CloudResourceKind.directory,
+      ),
+      status: _enumValue(
+        CloudResourceTmdbStatus.values,
+        json['status'],
+        CloudResourceTmdbStatus.unchecked,
+      ),
+      checkedAt: DateTime.fromMillisecondsSinceEpoch(
+        _asInt(json['checkedAtMillis']),
+        isUtc: true,
+      ),
+      tmdbId: _asNullableInt(json['tmdbId']),
+      mediaType: json['mediaType'] == null
+          ? null
+          : _enumValue(
+              TmdbMediaType.values,
+              json['mediaType'],
+              TmdbMediaType.tv,
+            ),
+      title: _asString(json['title']),
+      aliases: _asStringList(json['aliases']),
+      genres: _asStringList(json['genres']),
+      originalTitle: _asString(json['originalTitle']),
+      overview: _asString(json['overview']),
+      rating: _asDouble(json['rating']),
+      popularity: _asDouble(json['popularity']),
+      voteCount: _asNullableInt(json['voteCount']),
+      releaseDate: _asString(json['releaseDate']),
+      posterUrl: _asString(json['posterUrl']),
+      backdropUrl: _asString(json['backdropUrl']),
+      posterCachePath: _asString(json['posterCachePath']),
+      customTitle: _asString(json['customTitle']),
+      tmdbMatchOrigin: _enumValue(
+        TmdbMatchOrigin.values,
+        json['tmdbMatchOrigin'],
+        TmdbMatchOrigin.legacyUnknown,
+      ),
+      tmdbRuleVersion: _asInt(json['tmdbRuleVersion']),
+      seasons: json['seasons'] is List
+          ? (json['seasons'] as List)
+              .whereType<Map<Object?, Object?>>()
+              .map(
+                (item) => TmdbSeasonMetadata.fromJson(
+                  Map<String, dynamic>.from(item),
+                ),
+              )
+              .toList(growable: false)
+          : const <TmdbSeasonMetadata>[],
+    );
+  }
+
+  final String sourceId;
+  final String remoteId;
+  final String remotePath;
+  final String displayName;
+  final CloudResourceKind resourceKind;
+  final CloudResourceTmdbStatus status;
+  final DateTime checkedAt;
+  final int? tmdbId;
+  final TmdbMediaType? mediaType;
+  final String? title;
+  final List<String> aliases;
+  final List<String> genres;
+  final String? originalTitle;
+  final String? overview;
+  final double? rating;
+  final double? popularity;
+  final int? voteCount;
+  final String? releaseDate;
+  final String? posterUrl;
+  final String? backdropUrl;
+  final String? posterCachePath;
+  final String? customTitle;
+  final List<TmdbSeasonMetadata> seasons;
+  final TmdbMatchOrigin tmdbMatchOrigin;
+  final int tmdbRuleVersion;
+
+  String get stableKey => cloudResourceTmdbKey(
+        sourceId: sourceId,
+        remoteId: remoteId,
+        remotePath: remotePath,
+      );
+
+  String get effectiveTitle {
+    final custom = customTitle?.trim();
+    if (custom != null && custom.isNotEmpty) return custom;
+    final matchedTitle = title?.trim();
+    if (matchedTitle != null && matchedTitle.isNotEmpty) return matchedTitle;
+    return displayName;
+  }
+
+  CloudResourceTmdbRecord withCustomTitle(String value) {
+    final normalized = value.trim();
+    return _copyWithCustomTitle(normalized.isEmpty ? null : normalized);
+  }
+
+  CloudResourceTmdbRecord clearCustomTitle() => _copyWithCustomTitle(null);
+
+  CloudResourceTmdbRecord asFailed(DateTime checkedAt) {
+    return CloudResourceTmdbRecord.failed(
+      sourceId: sourceId,
+      remoteId: remoteId,
+      remotePath: remotePath,
+      displayName: displayName,
+      resourceKind: resourceKind,
+      checkedAt: checkedAt,
+      customTitle: customTitle,
+    );
+  }
+
+  CloudResourceTmdbRecord asConflict(DateTime checkedAt) {
+    return CloudResourceTmdbRecord(
+      sourceId: sourceId,
+      remoteId: remoteId,
+      remotePath: remotePath,
+      displayName: displayName,
+      resourceKind: resourceKind,
+      status: CloudResourceTmdbStatus.conflict,
+      checkedAt: checkedAt,
+      tmdbId: tmdbId,
+      mediaType: mediaType,
+      title: title,
+      aliases: aliases,
+      genres: genres,
+      originalTitle: originalTitle,
+      overview: overview,
+      rating: rating,
+      popularity: popularity,
+      voteCount: voteCount,
+      releaseDate: releaseDate,
+      posterUrl: posterUrl,
+      backdropUrl: backdropUrl,
+      posterCachePath: posterCachePath,
+      customTitle: customTitle,
+      seasons: seasons,
+      tmdbMatchOrigin: tmdbMatchOrigin,
+      tmdbRuleVersion: tmdbRuleVersion,
+    );
+  }
+
+  CloudResourceTmdbRecord rebindForTransfer({
+    required String sourceId,
+    required String remoteId,
+    required String remotePath,
+    required String? posterCachePath,
+    required List<TmdbSeasonMetadata> seasons,
+  }) {
+    return CloudResourceTmdbRecord(
+      sourceId: sourceId,
+      remoteId: remoteId,
+      remotePath: remotePath,
+      displayName: displayName,
+      resourceKind: resourceKind,
+      status: status,
+      checkedAt: checkedAt,
+      tmdbId: tmdbId,
+      mediaType: mediaType,
+      title: title,
+      aliases: aliases,
+      genres: genres,
+      originalTitle: originalTitle,
+      overview: overview,
+      rating: rating,
+      popularity: popularity,
+      voteCount: voteCount,
+      releaseDate: releaseDate,
+      posterUrl: posterUrl,
+      backdropUrl: backdropUrl,
+      posterCachePath: posterCachePath,
+      customTitle: customTitle,
+      seasons: seasons,
+      tmdbMatchOrigin: tmdbMatchOrigin,
+      tmdbRuleVersion: tmdbRuleVersion,
+    );
+  }
+
+  Map<String, Object?> toJson() {
+    return <String, Object?>{
+      'sourceId': sourceId,
+      'remoteId': remoteId,
+      'remotePath': remotePath,
+      'displayName': displayName,
+      'resourceKind': resourceKind.name,
+      'status': status.name,
+      'checkedAtMillis': checkedAt.millisecondsSinceEpoch,
+      if (tmdbId != null) 'tmdbId': tmdbId,
+      if (mediaType != null) 'mediaType': mediaType!.name,
+      if (title != null) 'title': title,
+      if (aliases.isNotEmpty) 'aliases': aliases,
+      if (genres.isNotEmpty) 'genres': genres,
+      if (originalTitle != null) 'originalTitle': originalTitle,
+      if (overview != null) 'overview': overview,
+      if (rating != null) 'rating': rating,
+      if (popularity != null) 'popularity': popularity,
+      if (voteCount != null) 'voteCount': voteCount,
+      if (releaseDate != null) 'releaseDate': releaseDate,
+      if (posterUrl != null) 'posterUrl': posterUrl,
+      if (backdropUrl != null) 'backdropUrl': backdropUrl,
+      if (posterCachePath != null) 'posterCachePath': posterCachePath,
+      if (customTitle != null) 'customTitle': customTitle,
+      if (tmdbMatchOrigin != TmdbMatchOrigin.legacyUnknown)
+        'tmdbMatchOrigin': tmdbMatchOrigin.name,
+      if (tmdbRuleVersion > 0) 'tmdbRuleVersion': tmdbRuleVersion,
+      if (seasons.isNotEmpty)
+        'seasons': seasons.map((item) => item.toJson()).toList(growable: false),
+    };
+  }
+
+  @override
+  bool operator ==(Object other) {
+    return identical(this, other) ||
+        other is CloudResourceTmdbRecord &&
+            sourceId == other.sourceId &&
+            remoteId == other.remoteId &&
+            remotePath == other.remotePath &&
+            displayName == other.displayName &&
+            resourceKind == other.resourceKind &&
+            status == other.status &&
+            checkedAt == other.checkedAt &&
+            tmdbId == other.tmdbId &&
+            mediaType == other.mediaType &&
+            title == other.title &&
+            _stringListsEqual(aliases, other.aliases) &&
+            _stringListsEqual(genres, other.genres) &&
+            originalTitle == other.originalTitle &&
+            overview == other.overview &&
+            rating == other.rating &&
+            popularity == other.popularity &&
+            voteCount == other.voteCount &&
+            releaseDate == other.releaseDate &&
+            posterUrl == other.posterUrl &&
+            backdropUrl == other.backdropUrl &&
+            posterCachePath == other.posterCachePath &&
+            customTitle == other.customTitle &&
+            tmdbMatchOrigin == other.tmdbMatchOrigin &&
+            tmdbRuleVersion == other.tmdbRuleVersion &&
+            _seasonListsEqual(seasons, other.seasons);
+  }
+
+  @override
+  int get hashCode => Object.hashAll(<Object?>[
+        sourceId,
+        remoteId,
+        remotePath,
+        displayName,
+        resourceKind,
+        status,
+        checkedAt,
+        tmdbId,
+        mediaType,
+        title,
+        Object.hashAll(aliases),
+        Object.hashAll(genres),
+        originalTitle,
+        overview,
+        rating,
+        popularity,
+        voteCount,
+        releaseDate,
+        posterUrl,
+        backdropUrl,
+        posterCachePath,
+        customTitle,
+        tmdbMatchOrigin,
+        tmdbRuleVersion,
+        Object.hashAll(seasons),
+      ]);
+
+  CloudResourceTmdbRecord _copyWithCustomTitle(String? value) {
+    return CloudResourceTmdbRecord(
+      sourceId: sourceId,
+      remoteId: remoteId,
+      remotePath: remotePath,
+      displayName: displayName,
+      resourceKind: resourceKind,
+      status: status,
+      checkedAt: checkedAt,
+      tmdbId: tmdbId,
+      mediaType: mediaType,
+      title: title,
+      aliases: aliases,
+      genres: genres,
+      originalTitle: originalTitle,
+      overview: overview,
+      rating: rating,
+      popularity: popularity,
+      voteCount: voteCount,
+      releaseDate: releaseDate,
+      posterUrl: posterUrl,
+      backdropUrl: backdropUrl,
+      posterCachePath: posterCachePath,
+      customTitle: value,
+      seasons: seasons,
+      tmdbMatchOrigin: tmdbMatchOrigin,
+      tmdbRuleVersion: tmdbRuleVersion,
+    );
+  }
+}
+
+bool _seasonListsEqual(
+  List<TmdbSeasonMetadata> first,
+  List<TmdbSeasonMetadata> second,
+) {
+  if (identical(first, second)) return true;
+  if (first.length != second.length) return false;
+  for (var index = 0; index < first.length; index++) {
+    if (first[index] != second[index]) return false;
+  }
+  return true;
+}
+
+bool _stringListsEqual(List<String> first, List<String> second) {
+  if (identical(first, second)) return true;
+  if (first.length != second.length) return false;
+  for (var index = 0; index < first.length; index++) {
+    if (first[index] != second[index]) return false;
+  }
+  return true;
+}
+
+T _enumValue<T extends Enum>(List<T> values, Object? raw, T fallback) {
+  final name = raw?.toString();
+  for (final value in values) {
+    if (value.name == name) return value;
+  }
+  return fallback;
+}
+
+int _asInt(Object? value) => _asNullableInt(value) ?? 0;
+
+int? _asNullableInt(Object? value) {
+  if (value is int) return value;
+  if (value is num) return value.toInt();
+  return int.tryParse(value?.toString() ?? '');
+}
+
+double? _asDouble(Object? value) {
+  if (value is num) return value.toDouble();
+  return double.tryParse(value?.toString() ?? '');
+}
+
+String? _asString(Object? value) {
+  final text = value?.toString();
+  return text == null || text.isEmpty ? null : text;
+}
+
+List<String> _asStringList(Object? value) {
+  if (value is! List) return const <String>[];
+  final result = <String>[];
+  final seen = <String>{};
+  for (final item in value) {
+    final text = item?.toString().trim() ?? '';
+    if (text.isNotEmpty && seen.add(text)) result.add(text);
+  }
+  return List<String>.unmodifiable(result);
+}

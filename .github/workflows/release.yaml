@@ -1,0 +1,152 @@
+name: Windows EXE 发布
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 发布既有标签，例如 v1.2.3
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  windows-release:
+    name: Windows Release 与 EXE 发布
+    runs-on: windows-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}
+
+      - name: 配置 Flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          channel: stable
+          flutter-version-file: pubspec.yaml
+
+      - name: 获取依赖
+        run: flutter pub get
+
+      - name: Dart 格式检查
+        run: dart format --output=none --set-exit-if-changed .
+
+      - name: Flutter 静态分析
+        run: flutter analyze --no-pub
+
+      - name: Flutter 测试
+        run: flutter test --no-pub
+
+      - name: 构建 Windows Release
+        env:
+          KANYINGYIN_XUNLEI_CLIENT_ID: ${{ secrets.KANYINGYIN_XUNLEI_CLIENT_ID }}
+          KANYINGYIN_XUNLEI_CLIENT_SECRET: ${{ secrets.KANYINGYIN_XUNLEI_CLIENT_SECRET }}
+          KANYINGYIN_XUNLEI_WEB_CLIENT_ID: ${{ secrets.KANYINGYIN_XUNLEI_WEB_CLIENT_ID }}
+          KANYINGYIN_XUNLEI_APP_KEY: ${{ secrets.KANYINGYIN_XUNLEI_APP_KEY }}
+        shell: pwsh
+        run: |
+          $runnerTemporaryBase = [System.IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\') + '\'
+          $xunleiTemporaryRoot = Join-Path $env:RUNNER_TEMP ("kanyingyin-xunlei-release-{0}" -f [Guid]::NewGuid().ToString('N'))
+          $resolvedXunleiTemporaryRoot = [System.IO.Path]::GetFullPath($xunleiTemporaryRoot)
+          if (-not $resolvedXunleiTemporaryRoot.StartsWith($runnerTemporaryBase, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw '迅雷 Release 构建临时目录越界'
+          }
+          $xunleiDefineFile = Join-Path $xunleiTemporaryRoot 'xunlei.build.json'
+          $requiredSecrets = @(
+            'KANYINGYIN_XUNLEI_CLIENT_ID',
+            'KANYINGYIN_XUNLEI_CLIENT_SECRET',
+            'KANYINGYIN_XUNLEI_WEB_CLIENT_ID',
+            'KANYINGYIN_XUNLEI_APP_KEY'
+          )
+          try {
+            foreach ($name in $requiredSecrets) {
+              if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+                throw "迅雷 Release 构建缺少必要 Secret：$name"
+              }
+            }
+            New-Item -ItemType Directory -Path $xunleiTemporaryRoot -Force | Out-Null
+            dart run tool/export_xunlei_build_define.dart `
+              --client-id $env:KANYINGYIN_XUNLEI_CLIENT_ID `
+              --client-secret $env:KANYINGYIN_XUNLEI_CLIENT_SECRET `
+              --web-client-id $env:KANYINGYIN_XUNLEI_WEB_CLIENT_ID `
+              --app-key $env:KANYINGYIN_XUNLEI_APP_KEY `
+              --output $xunleiDefineFile
+            if ($LASTEXITCODE -ne 0) { throw '生成迅雷 Release 构建参数失败' }
+
+            flutter build windows --release --no-pub "--dart-define-from-file=$xunleiDefineFile"
+            if ($LASTEXITCODE -ne 0) { throw 'Windows Release 构建失败' }
+          } finally {
+            foreach ($name in $requiredSecrets) {
+              Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+            }
+            if (Test-Path -LiteralPath $xunleiDefineFile) {
+              Remove-Item -LiteralPath $xunleiDefineFile -Force
+            }
+            if (Test-Path -LiteralPath $xunleiTemporaryRoot) {
+              Remove-Item -LiteralPath $xunleiTemporaryRoot -Recurse -Force
+            }
+          }
+
+      - name: 校验应用版本与标签
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+        shell: pwsh
+        run: |
+          if ($env:RELEASE_TAG -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') { throw "发布标签格式无效: $env:RELEASE_TAG" }
+          git show-ref --verify --quiet "refs/tags/$env:RELEASE_TAG"
+          if ($LASTEXITCODE -ne 0) { throw "发布标签不存在: $env:RELEASE_TAG" }
+          $tagCommit = (git rev-list -n 1 $env:RELEASE_TAG).Trim()
+          $headCommit = (git rev-parse HEAD).Trim()
+          if ($tagCommit -ne $headCommit) { throw "标签 $env:RELEASE_TAG 未指向当前 HEAD" }
+
+          $pubspec = Get-Content -LiteralPath 'pubspec.yaml' -Raw -Encoding UTF8
+          $versionMatch = [regex]::Match($pubspec, '(?m)^version:\s*([0-9]+\.[0-9]+\.[0-9]+)(?:\+[0-9]+)?\s*$')
+          if (-not $versionMatch.Success) { throw '无法从 pubspec.yaml 读取应用版本' }
+          $appVersion = $versionMatch.Groups[1].Value.Trim()
+          if ($env:RELEASE_TAG -ne "v$appVersion") { throw "标签 $env:RELEASE_TAG 与 pubspec 版本 $appVersion 不一致" }
+          "RELEASE_TAG=$env:RELEASE_TAG" >> $env:GITHUB_ENV
+          "APP_VERSION=$appVersion" >> $env:GITHUB_ENV
+
+      - name: 安装 Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      - name: 生成 EXE 安装程序
+        shell: pwsh
+        run: |
+          $outputDirectory = Join-Path $env:GITHUB_WORKSPACE 'build/windows/exe_output'
+          New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
+          & .\tool\windows\installer\build_inno_setup.ps1 `
+            -Version $env:APP_VERSION `
+            -ReleaseDirectory 'build/windows/x64/runner/Release' `
+            -DesktopDirectory $outputDirectory
+
+      - name: 验证 EXE 安装程序
+        shell: pwsh
+        run: |
+          $files = @(Get-ChildItem -LiteralPath 'build/windows/exe_output' -Filter '*.exe' -File)
+          if ($files.Count -ne 1) { throw "必须恰好生成 1 个 EXE 安装程序，实际为 $($files.Count) 个" }
+          $installer = $files[0]
+          $expectedName = "看影音-$env:APP_VERSION-测试版-安装程序.exe"
+          if ($installer.Name -ne $expectedName) { throw "安装程序文件名不匹配: $($installer.Name)" }
+          if (-not $installer.VersionInfo.ProductVersion.StartsWith($env:APP_VERSION, [System.StringComparison]::Ordinal)) {
+            throw "安装程序版本不匹配: $($installer.VersionInfo.ProductVersion)"
+          }
+          $hash = Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256
+          $signature = Get-AuthenticodeSignature -LiteralPath $installer.FullName
+          "EXE=$($installer.FullName)"
+          "SHA256=$($hash.Hash)"
+          "Authenticode=$($signature.Status)"
+
+      - name: 发布 GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          files: build/windows/exe_output/看影音-${{ env.APP_VERSION }}-测试版-安装程序.exe
